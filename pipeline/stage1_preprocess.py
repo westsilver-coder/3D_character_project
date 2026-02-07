@@ -36,6 +36,8 @@ SAM_CHECKPOINT_PATH = PROJECT_ROOT / "checkpoints" / "sam_vit_h_4b8939.pth"
 SAM_MODEL_TYPE = "vit_h"  # vit_h / vit_l / vit_b (체크포인트와 일치해야 함)
 SAM_ALPHA_THRESHOLD = 170   # 알파 threshold: 경계 노이즈 억제 (0~255)
 SAM_USE_EROSION = True       # 경계 halo 감소를 위한 erosion (MinFilter)
+# 테스트용: 처음 N장만 처리 (None이면 전체). 코드 상단 또는 CLI --max-images 로 지정.
+MAX_IMAGES = None  # 예: 1 또는 3 으로 설정하면 해당 장수만 처리
 
 # rembg 사용 여부 (인물 마스크용). 설치: pip install rembg[gpu] 또는 rembg
 try:
@@ -99,15 +101,20 @@ def _create_sam_mask_generator(
 ) -> Any:
     """
     SAM SamAutomaticMaskGenerator 생성 (배치에서 한 번만 호출).
+    GPU에 로드하여 CPU에서의 극심한 지연을 방지.
     segment-anything 미설치 또는 체크포인트 없으면 None 반환.
     """
     if not HAS_SAM:
         return None
+    import torch
+
     path = Path(checkpoint_path or SAM_CHECKPOINT_PATH)
     if not path.is_file():
         return None
     model_type = model_type or SAM_MODEL_TYPE
     sam = sam_model_registry[model_type](checkpoint=str(path))
+    sam.to("cuda")
+    print("SAM device:", next(sam.parameters()).device, flush=True)
     return SamAutomaticMaskGenerator(sam)
 
 
@@ -126,7 +133,10 @@ def _apply_person_mask_sam(
     arr = np.array(img)
     if arr.ndim != 3 or arr.shape[-1] != 3:
         return img
-    masks = mask_generator.generate(arr)
+    import torch
+
+    with torch.no_grad():
+        masks = mask_generator.generate(arr)
     if not masks:
         return img
     # area가 가장 큰 마스크를 "사람"으로 가정 (전신 촬영 시 인물이 가장 큰 영역)
@@ -172,11 +182,13 @@ def run(
     use_sam: bool = False,
     use_person_mask: bool = USE_PERSON_MASK,
     color_normalize: bool = COLOR_NORMALIZE,
+    max_images: int | None = None,
 ) -> list[Path]:
     """
     Stage 1 전처리 실행.
     raw_dir 이미지를 읽어 리사이즈 → (옵션) 색상 정규화 → (옵션) 인물 마스크 → processed_dir에 저장.
     마스크 우선순위: use_sam → SAM, else use_person_mask → rembg, else 마스크 없음.
+    max_images: None이면 전체, N이면 처음 N장만 처리 (테스트용).
     저장 파일 경로 목록 반환.
     """
     from PIL import Image
@@ -192,6 +204,12 @@ def run(
     if not paths:
         raise FileNotFoundError(f"No images found in {raw_dir} (extensions: {SUPPORTED_EXTENSIONS})")
 
+    # 테스트용: 처리할 이미지 수 제한 (코드 상단 MAX_IMAGES 또는 인자 max_images)
+    limit = max_images if max_images is not None else MAX_IMAGES
+    if limit is not None and limit >= 1:
+        paths = paths[: int(limit)]
+        print(f"[Stage1] Limiting to first {len(paths)} image(s) (max_images={limit})", flush=True)
+
     # SAM 사용 시 배치용 generator 한 번만 생성 (COLMAP/3DGS 일관된 전경 실루엣)
     sam_generator: Any = None
     if use_sam:
@@ -200,15 +218,18 @@ def run(
                 "segment-anything is not installed. Install with: pip install segment-anything\n"
                 "Download SAM checkpoint and set SAM_CHECKPOINT_PATH (e.g. sam_vit_h_4b8939.pth)."
             )
+        print("[Stage1] Loading SAM model (GPU)...", flush=True)
         sam_generator = _create_sam_mask_generator()
         if sam_generator is None:
             raise FileNotFoundError(
                 f"SAM checkpoint not found at {SAM_CHECKPOINT_PATH}. "
                 "Download from https://github.com/facebookresearch/segment-anything#model-checkpoints"
             )
+        print("[Stage1] SAM ready.", flush=True)
 
     saved: list[Path] = []
     for i, src_path in enumerate(paths):
+        print(f"[Stage1] Processing {i+1}/{len(paths)}: {src_path.name}", flush=True)
         img = Image.open(src_path).convert("RGB")
         img = _resize_max_side(img, max_size)
         if color_normalize:
@@ -237,6 +258,7 @@ def main() -> None:
     parser.add_argument("--no-mask", action="store_true", help="인물 마스크 비활성화 (SAM/rembg 모두 미사용)")
     parser.add_argument("--use-sam", action="store_true", help="인물 마스크에 SAM(Segment Anything) 사용 (rembg 대신)")
     parser.add_argument("--no-color-norm", action="store_true", help="색상 정규화 비활성화")
+    parser.add_argument("--max-images", type=int, default=None, metavar="N", help="테스트용: 처음 N장만 처리 (예: 1)")
     args = parser.parse_args()
 
     # 마스크: --no-mask면 없음, --use-sam이면 SAM, 아니면 rembg (rembg 미설치 시 경고)
@@ -263,8 +285,9 @@ def main() -> None:
         use_sam=use_sam,
         use_person_mask=use_person_mask,
         color_normalize=not args.no_color_norm,
+        max_images=args.max_images,
     )
-    print(f"Stage 1 done. Saved {len(saved)} images to {args.out}")
+    print(f"Stage 1 done. Saved {len(saved)} images to {args.out}", flush=True)
 
 
 if __name__ == "__main__":
