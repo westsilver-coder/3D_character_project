@@ -310,7 +310,8 @@ def _apply_person_mask_yolo_sam(
     box_xyxy = np.array([x1, y1, x2, y2], dtype=np.float32)
     with torch.no_grad():
         masks, _scores, _logits = sam_predictor.predict(box=box_xyxy, multimask_output=False)
-    if not masks or masks.size == 0:
+    # SamPredictor.predict()는 numpy array (N,H,W) 반환. "not masks"는 array에 대해 ambiguous 에러 유발
+    if len(masks) == 0:
         return img
     mask = masks[0]  # (H, W) bool
     alpha = np.where(mask, 255, 0).astype(np.uint8)
