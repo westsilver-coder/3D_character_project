@@ -39,15 +39,20 @@ SAM_USE_EROSION = True       # 경계 halo 감소를 위한 erosion (MinFilter)
 # 테스트용: 처음 N장만 처리 (None이면 전체). 코드 상단 또는 CLI --max-images 로 지정.
 MAX_IMAGES = None  # 예: 1 또는 3 으로 설정하면 해당 장수만 처리
 
-# YOLOv8 (ultralytics). YOLO+SAM 파이프라인에서 "어디를 볼지" 결정. semantic 판단은 YOLO만 수행.
-# 배경이 크고 인물이 작은 구도도 지원: YOLO가 person bbox만 찾으면 그 crop만 SAM에 넣어서 처리.
-YOLO_MODEL = "yolov8n.pt"   # yolov8n.pt / yolov8s.pt (가벼운 쪽이 빠름)
-YOLO_CONF_THRESHOLD = 0.25  # person 검출 최소 confidence (작은 인물이면 더 낮춰 볼 수 있음, 예: 0.2)
+# YOLOv8 (ultralytics). detection(bbox) / segmentation(person mask) 지원.
+YOLO_MODEL = "yolov8n.pt"   # bbox용 (detection)
+YOLO_SEG_MODEL = "yolov8n-seg.pt"  # --use-yolo-sam 시 사용. person class만 사용해 semantic 일관성 보장 (옵션 A)
+YOLO_CONF_THRESHOLD = 0.25  # person 검출 최소 confidence
 YOLO_PERSON_CLASS_ID = 0    # COCO "person"
-YOLO_SAM_MIN_CROP_SIDE = 32  # crop 한 변이 이보다 작으면 패딩으로 확장 (SAM 입력 최소 크기)
-# 옵션 A: YOLO+SAM 시 bbox 패딩 비율(10~15%), morphological closing 커널 크기 (팔/다리/치마 안쪽 구멍 제거)
-YOLO_SAM_BBOX_PADDING_RATIO = 0.15   # bbox 확장 (경계 잘림 방지)
-YOLO_SAM_CLOSING_KERNEL_SIZE = 11    # MORPH_CLOSE 커널 (구멍 메우기, 홀수 권장)
+YOLO_SAM_MIN_CROP_SIDE = 32  # (SAM 사용 시) crop 최소 한 변
+# 옵션 A 이전: YOLO+SAM 시 bbox 패딩, closing (현재 --use-yolo-sam은 YOLO-seg 단독으로 전환)
+YOLO_SAM_BBOX_PADDING_RATIO = 0.15
+YOLO_SAM_CLOSING_KERNEL_SIZE = 11
+# YOLO-seg 전용: morphological closing 커널 (내부 hole 제거)
+YOLO_SEG_CLOSING_KERNEL_SIZE = 11
+# 마스크 품질 검증: foreground_area/bbox_area < threshold → 실패(저장 안 함). COLMAP 입력에서 사람이 사라지는 것 방지.
+MASK_FG_RATIO_MIN = 0.15        # 기본: 이 비율 미만이면 discard
+MASK_FG_RATIO_MIN_STRICT = 0.25  # --strict-mask 시 더 엄격
 
 # rembg 사용 여부 (인물 마스크용). 설치: pip install rembg[gpu] 또는 rembg
 try:
@@ -164,6 +169,18 @@ def _load_yolo_model(model_name: str | None = None) -> Any:
     if not HAS_YOLO:
         return None
     name = model_name or YOLO_MODEL
+    try:
+        model = YOLO(name)
+        return model
+    except Exception:
+        return None
+
+
+def _load_yolo_seg_model(model_name: str | None = None) -> Any:
+    """YOLOv8-seg 모델 로드 (--use-yolo-sam 전용). person class mask만 사용해 semantic 일관성 보장."""
+    if not HAS_YOLO:
+        return None
+    name = model_name or YOLO_SEG_MODEL
     try:
         model = YOLO(name)
         return model
@@ -333,6 +350,91 @@ def _apply_person_mask_yolo_sam(
     return out
 
 
+def _apply_person_mask_yolo_seg(
+    img: PILImage.Image,
+    yolo_seg_model: Any,
+    strict: bool = False,
+) -> tuple[PILImage.Image, bool]:
+    """
+    YOLOv8-seg로 인물 마스크 (옵션 A: SAM 제거, semantic 일관성 우선).
+
+    선택 이유: SAM box prompt는 배경/의상 유사 시 배경을 foreground로 선택하거나,
+    사람이 사라지는 프레임이 발생함. YOLOv8-seg는 class=person만 사용하므로
+    "사람 = foreground"가 보장됨. 내부 hole은 morphological closing으로 제거.
+    반환: (합성 이미지, 검증 통과 여부). False면 해당 프레임 저장 안 함(skip).
+    """
+    import numpy as np
+    from PIL import Image
+
+    arr = np.array(img)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        return (img, False)
+    H, W = arr.shape[0], arr.shape[1]
+
+    if not HAS_YOLO or yolo_seg_model is None:
+        return (img, False)
+    # retina_masks=True → 마스크 해상도가 입력 이미지와 동일
+    results = yolo_seg_model(arr, retina_masks=True, verbose=False)[0]
+    if results.masks is None or results.boxes is None:
+        return (img, False)
+    boxes = results.boxes
+    masks_data = results.masks.data  # (N, H', W') tensor
+    cls = boxes.cls.cpu().numpy()
+    # person(class 0) 인 인덱스만 사용
+    person_idx = [i for i in range(len(cls)) if int(cls[i]) == YOLO_PERSON_CLASS_ID and boxes.conf[i].cpu().numpy() >= YOLO_CONF_THRESHOLD]
+    if not person_idx:
+        return (img, False)
+    # 마스크를 이미지 크기에 맞춤 (동일하면 그대로, 다르면 리사이즈)
+    combined = np.zeros((H, W), dtype=np.uint8)
+    for i in person_idx:
+        m = results.masks.data[i]
+        if hasattr(m, "cpu"):
+            m = m.cpu().numpy()
+        m = np.squeeze(m)
+        if m.ndim != 2:
+            continue
+        if m.shape[0] != H or m.shape[1] != W:
+            from PIL import Image as PILImageModule
+            pil_m = PILImageModule.fromarray((m * 255).astype(np.uint8))
+            pil_m = pil_m.resize((W, H), resample=PILImageModule.NEAREST)
+            m = (np.array(pil_m) > 127).astype(np.uint8)
+        else:
+            m = (m > 0.5).astype(np.uint8) if m.dtype != np.uint8 else m
+        combined = np.maximum(combined, m)
+    if combined.max() == 0:
+        return (img, False)
+    alpha = (combined * 255).astype(np.uint8)
+
+    # bbox 면적 (person bbox들의 union으로 근사: 모든 person box를 감싸는 영역)
+    xyxy = boxes.xyxy.cpu().numpy()
+    person_boxes = xyxy[person_idx]
+    x1 = int(max(0, person_boxes[:, 0].min()))
+    y1 = int(max(0, person_boxes[:, 1].min()))
+    x2 = int(min(W, person_boxes[:, 2].max()))
+    y2 = int(min(H, person_boxes[:, 3].max()))
+    bbox_area = max(1, (x2 - x1) * (y2 - y1))
+    fg_area = int((alpha > 0).sum())
+    fg_ratio = fg_area / bbox_area
+    threshold = MASK_FG_RATIO_MIN_STRICT if strict else MASK_FG_RATIO_MIN
+    if fg_ratio < threshold:
+        return (img, False)
+
+    # Morphological closing: 내부 구멍 제거
+    try:
+        import cv2  # type: ignore[import-untyped]
+        k = YOLO_SEG_CLOSING_KERNEL_SIZE
+        if k >= 3:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, kernel)
+    except ImportError:
+        pass
+
+    bg = Image.new("RGB", img.size, BACKGROUND_RGB)
+    rgb = img.convert("RGB")
+    out = Image.composite(rgb, bg, Image.fromarray(alpha))
+    return (out, True)
+
+
 def _apply_person_mask(img: PILImage.Image) -> PILImage.Image:
     """인물 마스크 적용 (rembg): 배경을 BACKGROUND_RGB로 교체. rembg 없으면 원본 반환."""
     from PIL import Image
@@ -359,12 +461,13 @@ def run(
     use_person_mask: bool = USE_PERSON_MASK,
     color_normalize: bool = COLOR_NORMALIZE,
     max_images: int | None = None,
+    strict_mask: bool = False,
 ) -> list[Path]:
     """
     Stage 1 전처리 실행.
     raw_dir 이미지를 읽어 리사이즈 → (옵션) 색상 정규화 → (옵션) 인물 마스크 → processed_dir에 저장.
-    마스크 우선순위: use_yolo_sam → YOLO+SAM, else use_sam → SAM만, else use_person_mask → rembg.
-    max_images: None이면 전체, N이면 처음 N장만 처리 (테스트용).
+    use_yolo_sam: YOLOv8-seg 단독 (옵션 A, SAM 미사용). 마스크 검증 실패 시 해당 프레임 저장 안 함.
+    strict_mask: True면 fg_ratio 기준 더 엄격하게 적용해 실패 프레임 제외.
     저장 파일 경로 목록 반환.
     """
     from PIL import Image
@@ -386,31 +489,22 @@ def run(
         paths = paths[: int(limit)]
         print(f"[Stage1] Limiting to first {len(paths)} image(s) (max_images={limit})", flush=True)
 
-    yolo_model: Any = None
-    sam_predictor: Any = None  # --use-yolo-sam: box prompt용 (옵션 A)
-    sam_generator: Any = None  # --use-sam: automatic mask generator용
+    yolo_seg_model: Any = None  # --use-yolo-sam: YOLOv8-seg 단독 (옵션 A, SAM 제거)
+    sam_generator: Any = None   # --use-sam: automatic mask generator용
 
     if use_yolo_sam:
         if not HAS_YOLO:
             raise RuntimeError(
                 "--use-yolo-sam requires ultralytics (YOLOv8). Install: pip install ultralytics"
             )
-        if not HAS_SAM:
+        print("[Stage1] Loading YOLOv8-seg (person mask only, Option A)...", flush=True)
+        yolo_seg_model = _load_yolo_seg_model()
+        if yolo_seg_model is None:
             raise RuntimeError(
-                "--use-yolo-sam requires segment-anything. Install: pip install segment-anything"
+                f"YOLO seg model could not be loaded: {YOLO_SEG_MODEL}. "
+                "Ensure yolov8n-seg.pt is available (downloads automatically on first run)."
             )
-        print("[Stage1] Loading YOLO (person detection)...", flush=True)
-        yolo_model = _load_yolo_model()
-        if yolo_model is None:
-            raise RuntimeError(f"YOLO model could not be loaded: {YOLO_MODEL}")
-        print("[Stage1] Loading SAM predictor (GPU, box prompt)...", flush=True)
-        sam_predictor = _create_sam_predictor()
-        if sam_predictor is None:
-            raise FileNotFoundError(
-                f"SAM checkpoint not found at {SAM_CHECKPOINT_PATH}. "
-                "Download from https://github.com/facebookresearch/segment-anything#model-checkpoints"
-            )
-        print("[Stage1] YOLO+SAM ready (Option A: predictor + closing).", flush=True)
+        print("[Stage1] YOLO-seg ready (semantic person mask + validation).", flush=True)
     elif use_sam:
         if not HAS_SAM:
             raise RuntimeError(
@@ -427,24 +521,31 @@ def run(
         print("[Stage1] SAM ready.", flush=True)
 
     saved: list[Path] = []
+    skipped = 0
     for i, src_path in enumerate(paths):
         print(f"[Stage1] Processing {i+1}/{len(paths)}: {src_path.name}", flush=True)
         img = Image.open(src_path).convert("RGB")
         img = _resize_max_side(img, max_size)
         if color_normalize:
             img = _color_normalize_simple(img)
-        if use_yolo_sam and yolo_model is not None and sam_predictor is not None:
-            img = _apply_person_mask_yolo_sam(img, yolo_model, sam_predictor)
+        if use_yolo_sam and yolo_seg_model is not None:
+            img, valid = _apply_person_mask_yolo_seg(img, yolo_seg_model, strict=strict_mask)
+            if not valid:
+                print(f"[Stage1] Mask validation failed, skipping: {src_path.name}", flush=True)
+                skipped += 1
+                continue
         elif use_sam and sam_generator is not None:
             img = _apply_person_mask_sam(img, sam_generator)
         elif use_person_mask:
             img = _apply_person_mask(img)
         # 3DGS 호환용 번호 붙인 파일명도 유지 (0000.png, 0001.png, ...)
         base = src_path.stem
-        out_name = f"{i:04d}_{base}.png"
+        out_name = f"{len(saved):04d}_{base}.png"
         out_path = processed_dir / out_name
         img.save(out_path, "PNG")
         saved.append(out_path)
+    if use_yolo_sam and skipped > 0:
+        print(f"[Stage1] Skipped {skipped} frame(s) due to mask validation.", flush=True)
     return saved
 
 
@@ -459,7 +560,8 @@ def main() -> None:
     parser.add_argument("--no-mask", action="store_true", help="인물 마스크 비활성화")
     parser.add_argument("--use-rembg", action="store_true", help="인물 마스크: rembg 사용 (기본값)")
     parser.add_argument("--use-sam", action="store_true", help="인물 마스크: SAM 단독 (가장 큰 segment 휴리스틱)")
-    parser.add_argument("--use-yolo-sam", action="store_true", help="인물 마스크: YOLOv8 bbox + SAM (복잡한 배경 권장)")
+    parser.add_argument("--use-yolo-sam", action="store_true", help="인물 마스크: YOLOv8-seg 단독 (person class만, COLMAP 안정용)")
+    parser.add_argument("--strict-mask", action="store_true", help="마스크 검증 더 엄격; 실패 프레임은 저장 안 함(COLMAP에서 제외)")
     parser.add_argument("--no-color-norm", action="store_true", help="색상 정규화 비활성화")
     parser.add_argument("--max-images", type=int, default=None, metavar="N", help="테스트용: 처음 N장만 처리 (예: 1)")
     args = parser.parse_args()
@@ -470,13 +572,8 @@ def main() -> None:
     use_sam = args.use_sam and not no_mask and not use_yolo_sam
     use_rembg = (args.use_rembg or (not no_mask and not use_yolo_sam and not use_sam))
 
-    if use_yolo_sam and (not HAS_YOLO or not HAS_SAM):
-        msg = "Error: --use-yolo-sam requires ultralytics and segment-anything.\n"
-        if not HAS_YOLO:
-            msg += "  pip install ultralytics\n"
-        if not HAS_SAM:
-            msg += "  pip install segment-anything (and SAM checkpoint)\n"
-        print(msg, file=sys.stderr)
+    if use_yolo_sam and not HAS_YOLO:
+        print("Error: --use-yolo-sam requires ultralytics (YOLOv8). Install: pip install ultralytics", file=sys.stderr)
         sys.exit(1)
 
     if use_sam and not HAS_SAM:
@@ -503,6 +600,7 @@ def main() -> None:
         use_person_mask=use_rembg,
         color_normalize=not args.no_color_norm,
         max_images=args.max_images,
+        strict_mask=args.strict_mask,
     )
     print(f"Stage 1 done. Saved {len(saved)} images to {args.out}", flush=True)
 
