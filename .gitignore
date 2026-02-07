@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data & outputs
+data/
+output/
+videos/
+
+# Checkpoints (절대 올리지 말 것)
+checkpoints/
+*.pth
+
+# OS
+.DS_Store
+Thumbs.db

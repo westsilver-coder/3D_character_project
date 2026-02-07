@@ -1,0 +1,17 @@
+# Core
+numpy
+Pillow
+opencv-python
+
+# ML
+torch
+torchvision
+
+# Background removal
+rembg
+
+# SAM
+segment-anything
+
+# Utils
+tqdm
