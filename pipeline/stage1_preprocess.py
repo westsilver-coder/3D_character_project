@@ -39,6 +39,13 @@ SAM_USE_EROSION = True       # 경계 halo 감소를 위한 erosion (MinFilter)
 # 테스트용: 처음 N장만 처리 (None이면 전체). 코드 상단 또는 CLI --max-images 로 지정.
 MAX_IMAGES = None  # 예: 1 또는 3 으로 설정하면 해당 장수만 처리
 
+# YOLOv8 (ultralytics). YOLO+SAM 파이프라인에서 "어디를 볼지" 결정. semantic 판단은 YOLO만 수행.
+# 배경이 크고 인물이 작은 구도도 지원: YOLO가 person bbox만 찾으면 그 crop만 SAM에 넣어서 처리.
+YOLO_MODEL = "yolov8n.pt"   # yolov8n.pt / yolov8s.pt (가벼운 쪽이 빠름)
+YOLO_CONF_THRESHOLD = 0.25  # person 검출 최소 confidence (작은 인물이면 더 낮춰 볼 수 있음, 예: 0.2)
+YOLO_PERSON_CLASS_ID = 0    # COCO "person"
+YOLO_SAM_MIN_CROP_SIDE = 32  # crop 한 변이 이보다 작으면 패딩으로 확장 (SAM 입력 최소 크기)
+
 # rembg 사용 여부 (인물 마스크용). 설치: pip install rembg[gpu] 또는 rembg
 try:
     from rembg import remove as rembg_remove  # type: ignore[import-untyped]
@@ -52,6 +59,13 @@ try:
     HAS_SAM = True
 except ImportError:
     HAS_SAM = False
+
+# ultralytics YOLOv8. 설치: pip install ultralytics
+try:
+    from ultralytics import YOLO  # type: ignore[import-untyped]
+    HAS_YOLO = True
+except ImportError:
+    HAS_YOLO = False
 
 
 def _list_image_paths(dir_path: Path) -> list[Path]:
@@ -93,6 +107,61 @@ def _color_normalize_simple(img: PILImage.Image) -> PILImage.Image:
         if hi > lo:
             out[..., c] = np.clip((ch.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(out)
+
+
+def _detect_person_bboxes(
+    img: PILImage.Image,
+    yolo_model: Any,
+    conf_threshold: float = YOLO_CONF_THRESHOLD,
+) -> list[tuple[int, int, int, int]]:
+    """
+    YOLOv8으로 "person" bbox 검출. class==person, conf>=threshold.
+    반환: [(x1,y1,x2,y2), ...] 픽셀 좌표, 면적 큰 순 정렬 (메인 인물 우선).
+    """
+    import numpy as np
+
+    if not HAS_YOLO or yolo_model is None:
+        return []
+    arr = np.array(img)
+    if arr.ndim != 3:
+        return []
+    # ultralytics: model(img) returns Results; .boxes.xyxy (tensor), .boxes.conf, .boxes.cls
+    results = yolo_model(arr, verbose=False)[0]
+    boxes = results.boxes
+    if boxes is None:
+        return []
+    xyxy = boxes.xyxy.cpu().numpy()
+    conf = boxes.conf.cpu().numpy()
+    cls = boxes.cls.cpu().numpy()
+    out = []
+    for i in range(len(cls)):
+        if int(cls[i]) != YOLO_PERSON_CLASS_ID:
+            continue
+        if conf[i] < conf_threshold:
+            continue
+        x1, y1, x2, y2 = map(int, xyxy[i])
+        # 클립 to image bounds
+        w, h = img.size
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
+        out.append((x1, y1, x2, y2))
+    # 면적 큰 순 (메인 인물 먼저)
+    out.sort(key=lambda r: (r[2] - r[0]) * (r[3] - r[1]), reverse=True)
+    return out
+
+
+def _load_yolo_model(model_name: str | None = None) -> Any:
+    """YOLOv8 모델 로드 (배치에서 한 번만). person 검출용."""
+    if not HAS_YOLO:
+        return None
+    name = model_name or YOLO_MODEL
+    try:
+        model = YOLO(name)
+        return model
+    except Exception:
+        return None
 
 
 def _create_sam_mask_generator(
@@ -158,6 +227,70 @@ def _apply_person_mask_sam(
     return out
 
 
+def _apply_person_mask_yolo_sam(
+    img: PILImage.Image,
+    yolo_model: Any,
+    mask_generator: Any,
+) -> PILImage.Image:
+    """
+    YOLOv8 + SAM 인물 중심 마스크.
+    YOLO가 "어디를 볼지"(person bbox) 결정 → bbox crop에만 SAM 실행 → bbox 내 최대 area가 인물.
+    bbox 외부는 무조건 배경. 경계 정교화는 SAM만 담당.
+    배경이 크고 인물이 작은 구도도 동작: 전경 크기에 상관없이 YOLO bbox만 잡히면 그 영역만 SAM 처리.
+    """
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    arr = np.array(img)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        return img
+    H, W = arr.shape[0], arr.shape[1]
+
+    bboxes = _detect_person_bboxes(img, yolo_model)
+    if not bboxes:
+        return img
+    x1, y1, x2, y2 = bboxes[0]
+    # 작은 인물일 때 crop이 너무 작으면 SAM 입력이 비정상적으로 작아질 수 있음 → 최소 크기만큼 패딩
+    cw, ch = x2 - x1, y2 - y1
+    min_side = YOLO_SAM_MIN_CROP_SIDE
+    if cw < min_side or ch < min_side:
+        pad_w = max(0, (min_side - cw + 1) // 2)
+        pad_h = max(0, (min_side - ch + 1) // 2)
+        x1 = max(0, x1 - pad_w)
+        y1 = max(0, y1 - pad_h)
+        x2 = min(W, x2 + pad_w)
+        y2 = min(H, y2 + pad_h)
+    crop = img.crop((x1, y1, x2, y2))
+    crop_arr = np.array(crop)
+    if crop_arr.size == 0:
+        return img
+
+    import torch
+
+    with torch.no_grad():
+        masks = mask_generator.generate(crop_arr)
+    if not masks:
+        return img
+    # bbox 내부에서 area 최대 segment = 인물 (semantic은 YOLO가 이미 person으로 한정)
+    best = max(masks, key=lambda m: m["area"])
+    seg = best["segmentation"]
+    crop_mask = np.where(seg, 255, 0).astype(np.uint8)
+    # 원본 크기로 복원: bbox 밖은 0
+    full_mask = np.zeros((H, W), dtype=np.uint8)
+    full_mask[y1:y2, x1:x2] = crop_mask
+    alpha = full_mask
+    if SAM_ALPHA_THRESHOLD > 0:
+        alpha = np.where(alpha >= SAM_ALPHA_THRESHOLD, 255, 0).astype(np.uint8)
+    if SAM_USE_EROSION:
+        pil_alpha = Image.fromarray(alpha)
+        pil_alpha = pil_alpha.filter(ImageFilter.MinFilter(size=3))
+        alpha = np.array(pil_alpha)
+    bg = Image.new("RGB", img.size, BACKGROUND_RGB)
+    rgb = img.convert("RGB")
+    out = Image.composite(rgb, bg, Image.fromarray(alpha))
+    return out
+
+
 def _apply_person_mask(img: PILImage.Image) -> PILImage.Image:
     """인물 마스크 적용 (rembg): 배경을 BACKGROUND_RGB로 교체. rembg 없으면 원본 반환."""
     from PIL import Image
@@ -179,6 +312,7 @@ def run(
     raw_dir: Path | None = None,
     processed_dir: Path | None = None,
     max_size: int = MAX_SIZE_PX,
+    use_yolo_sam: bool = False,
     use_sam: bool = False,
     use_person_mask: bool = USE_PERSON_MASK,
     color_normalize: bool = COLOR_NORMALIZE,
@@ -187,7 +321,7 @@ def run(
     """
     Stage 1 전처리 실행.
     raw_dir 이미지를 읽어 리사이즈 → (옵션) 색상 정규화 → (옵션) 인물 마스크 → processed_dir에 저장.
-    마스크 우선순위: use_sam → SAM, else use_person_mask → rembg, else 마스크 없음.
+    마스크 우선순위: use_yolo_sam → YOLO+SAM, else use_sam → SAM만, else use_person_mask → rembg.
     max_images: None이면 전체, N이면 처음 N장만 처리 (테스트용).
     저장 파일 경로 목록 반환.
     """
@@ -210,9 +344,31 @@ def run(
         paths = paths[: int(limit)]
         print(f"[Stage1] Limiting to first {len(paths)} image(s) (max_images={limit})", flush=True)
 
-    # SAM 사용 시 배치용 generator 한 번만 생성 (COLMAP/3DGS 일관된 전경 실루엣)
+    yolo_model: Any = None
     sam_generator: Any = None
-    if use_sam:
+
+    if use_yolo_sam:
+        if not HAS_YOLO:
+            raise RuntimeError(
+                "--use-yolo-sam requires ultralytics (YOLOv8). Install: pip install ultralytics"
+            )
+        if not HAS_SAM:
+            raise RuntimeError(
+                "--use-yolo-sam requires segment-anything. Install: pip install segment-anything"
+            )
+        print("[Stage1] Loading YOLO (person detection)...", flush=True)
+        yolo_model = _load_yolo_model()
+        if yolo_model is None:
+            raise RuntimeError(f"YOLO model could not be loaded: {YOLO_MODEL}")
+        print("[Stage1] Loading SAM model (GPU)...", flush=True)
+        sam_generator = _create_sam_mask_generator()
+        if sam_generator is None:
+            raise FileNotFoundError(
+                f"SAM checkpoint not found at {SAM_CHECKPOINT_PATH}. "
+                "Download from https://github.com/facebookresearch/segment-anything#model-checkpoints"
+            )
+        print("[Stage1] YOLO+SAM ready.", flush=True)
+    elif use_sam:
         if not HAS_SAM:
             raise RuntimeError(
                 "segment-anything is not installed. Install with: pip install segment-anything\n"
@@ -234,7 +390,9 @@ def run(
         img = _resize_max_side(img, max_size)
         if color_normalize:
             img = _color_normalize_simple(img)
-        if use_sam and sam_generator is not None:
+        if use_yolo_sam and yolo_model is not None and sam_generator is not None:
+            img = _apply_person_mask_yolo_sam(img, yolo_model, sam_generator)
+        elif use_sam and sam_generator is not None:
             img = _apply_person_mask_sam(img, sam_generator)
         elif use_person_mask:
             img = _apply_person_mask(img)
@@ -248,22 +406,35 @@ def run(
 
 
 def main() -> None:
-    """CLI 진입점. --use-sam → SAM, --no-mask → 마스크 없음, 기본 → rembg."""
+    """CLI 진입점. 마스크: --use-yolo-sam | --use-sam | --use-rembg | 기본 rembg. --no-mask로 비활성화."""
     import argparse
 
     parser = argparse.ArgumentParser(description="Stage 1: 이미지 전처리 (리사이즈, 색보정, 인물 마스크)")
     parser.add_argument("--raw", type=Path, default=RAW_IMAGES_DIR, help="원본 이미지 디렉터리")
     parser.add_argument("--out", type=Path, default=PROCESSED_IMAGES_DIR, help="전처리 결과 저장 디렉터리")
     parser.add_argument("--max-size", type=int, default=MAX_SIZE_PX, help="긴 변 최대 픽셀")
-    parser.add_argument("--no-mask", action="store_true", help="인물 마스크 비활성화 (SAM/rembg 모두 미사용)")
-    parser.add_argument("--use-sam", action="store_true", help="인물 마스크에 SAM(Segment Anything) 사용 (rembg 대신)")
+    parser.add_argument("--no-mask", action="store_true", help="인물 마스크 비활성화")
+    parser.add_argument("--use-rembg", action="store_true", help="인물 마스크: rembg 사용 (기본값)")
+    parser.add_argument("--use-sam", action="store_true", help="인물 마스크: SAM 단독 (가장 큰 segment 휴리스틱)")
+    parser.add_argument("--use-yolo-sam", action="store_true", help="인물 마스크: YOLOv8 bbox + SAM (복잡한 배경 권장)")
     parser.add_argument("--no-color-norm", action="store_true", help="색상 정규화 비활성화")
     parser.add_argument("--max-images", type=int, default=None, metavar="N", help="테스트용: 처음 N장만 처리 (예: 1)")
     args = parser.parse_args()
 
-    # 마스크: --no-mask면 없음, --use-sam이면 SAM, 아니면 rembg (rembg 미설치 시 경고)
-    use_sam = args.use_sam and not args.no_mask
-    use_person_mask = not args.no_mask and not use_sam
+    # 우선순위: --no-mask > --use-yolo-sam > --use-sam > --use-rembg 또는 기본 rembg
+    no_mask = args.no_mask
+    use_yolo_sam = args.use_yolo_sam and not no_mask
+    use_sam = args.use_sam and not no_mask and not use_yolo_sam
+    use_rembg = (args.use_rembg or (not no_mask and not use_yolo_sam and not use_sam))
+
+    if use_yolo_sam and (not HAS_YOLO or not HAS_SAM):
+        msg = "Error: --use-yolo-sam requires ultralytics and segment-anything.\n"
+        if not HAS_YOLO:
+            msg += "  pip install ultralytics\n"
+        if not HAS_SAM:
+            msg += "  pip install segment-anything (and SAM checkpoint)\n"
+        print(msg, file=sys.stderr)
+        sys.exit(1)
 
     if use_sam and not HAS_SAM:
         print(
@@ -274,16 +445,19 @@ def main() -> None:
         )
         sys.exit(1)
 
-    if use_person_mask and not HAS_REMBG:
-        print("Warning: rembg not installed. Run without person mask, or use --use-sam. Install: pip install rembg[gpu]")
-        use_person_mask = False
+    if use_rembg and not HAS_REMBG:
+        print("Warning: rembg not installed. Use --use-sam or --use-yolo-sam, or install: pip install rembg[gpu]", file=sys.stderr)
+        use_rembg = False
+        if not no_mask and not use_sam and not use_yolo_sam:
+            print("No mask method available. Proceeding without mask.", file=sys.stderr)
 
     saved = run(
         raw_dir=args.raw,
         processed_dir=args.out,
         max_size=args.max_size,
+        use_yolo_sam=use_yolo_sam,
         use_sam=use_sam,
-        use_person_mask=use_person_mask,
+        use_person_mask=use_rembg,
         color_normalize=not args.no_color_norm,
         max_images=args.max_images,
     )
