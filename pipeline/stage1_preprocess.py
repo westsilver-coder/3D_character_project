@@ -45,6 +45,9 @@ YOLO_MODEL = "yolov8n.pt"   # yolov8n.pt / yolov8s.pt (가벼운 쪽이 빠름)
 YOLO_CONF_THRESHOLD = 0.25  # person 검출 최소 confidence (작은 인물이면 더 낮춰 볼 수 있음, 예: 0.2)
 YOLO_PERSON_CLASS_ID = 0    # COCO "person"
 YOLO_SAM_MIN_CROP_SIDE = 32  # crop 한 변이 이보다 작으면 패딩으로 확장 (SAM 입력 최소 크기)
+# 옵션 A: YOLO+SAM 시 bbox 패딩 비율(10~15%), morphological closing 커널 크기 (팔/다리/치마 안쪽 구멍 제거)
+YOLO_SAM_BBOX_PADDING_RATIO = 0.15   # bbox 확장 (경계 잘림 방지)
+YOLO_SAM_CLOSING_KERNEL_SIZE = 11    # MORPH_CLOSE 커널 (구멍 메우기, 홀수 권장)
 
 # rembg 사용 여부 (인물 마스크용). 설치: pip install rembg[gpu] 또는 rembg
 try:
@@ -55,7 +58,11 @@ except ImportError:
 
 # segment-anything (SAM). 설치: pip install segment-anything; 체크포인트는 별도 다운로드.
 try:
-    from segment_anything import SamAutomaticMaskGenerator, sam_model_registry  # type: ignore[import-untyped]
+    from segment_anything import (  # type: ignore[import-untyped]
+        SamAutomaticMaskGenerator,
+        SamPredictor,
+        sam_model_registry,
+    )
     HAS_SAM = True
 except ImportError:
     HAS_SAM = False
@@ -187,6 +194,30 @@ def _create_sam_mask_generator(
     return SamAutomaticMaskGenerator(sam)
 
 
+def _create_sam_predictor(
+    checkpoint_path: Path | None = None,
+    model_type: str | None = None,
+) -> Any:
+    """
+    SAM SamPredictor 생성 (--use-yolo-sam 전용).
+    box prompt 방식으로 단일 인물 마스크를 얻기 위해 사용.
+    AutomaticMaskGenerator 대신 Predictor를 쓰면 "bbox 안의 하나의 객체"로 통째로 세그멘트되어
+    팔/다리/치마 안쪽 구멍이 생기지 않음 (옵션 A).
+    """
+    if not HAS_SAM:
+        return None
+    import torch
+
+    path = Path(checkpoint_path or SAM_CHECKPOINT_PATH)
+    if not path.is_file():
+        return None
+    model_type = model_type or SAM_MODEL_TYPE
+    sam = sam_model_registry[model_type](checkpoint=str(path))
+    sam.to("cuda")
+    print("SAM device (predictor):", next(sam.parameters()).device, flush=True)
+    return SamPredictor(sam)
+
+
 def _apply_person_mask_sam(
     img: PILImage.Image,
     mask_generator: Any,
@@ -230,16 +261,19 @@ def _apply_person_mask_sam(
 def _apply_person_mask_yolo_sam(
     img: PILImage.Image,
     yolo_model: Any,
-    mask_generator: Any,
+    sam_predictor: Any,
 ) -> PILImage.Image:
     """
-    YOLOv8 + SAM 인물 중심 마스크.
-    YOLO가 "어디를 볼지"(person bbox) 결정 → bbox crop에만 SAM 실행 → bbox 내 최대 area가 인물.
-    bbox 외부는 무조건 배경. 경계 정교화는 SAM만 담당.
-    배경이 크고 인물이 작은 구도도 동작: 전경 크기에 상관없이 YOLO bbox만 잡히면 그 영역만 SAM 처리.
+    YOLOv8 + SAM 인물 마스크 (옵션 A: SamPredictor + box prompt + closing).
+
+    선택 이유: AutomaticMaskGenerator는 bbox 내부를 여러 segment로 나누어
+    "area 최대 1개"만 쓰면 팔/다리/치마 안쪽이 배경으로 뚫리는 구멍이 발생.
+    SamPredictor에 YOLO bbox를 box prompt로 주면 "이 상자 안의 하나의 객체"로
+    통째로 세그멘트하므로 인물이 한 덩어리 mask가 됨. 이어서 morphological closing으로
+    미세 구멍을 제거해 COLMAP/3DGS용 solid 실루엣을 보장.
     """
     import numpy as np
-    from PIL import Image, ImageFilter
+    from PIL import Image
 
     arr = np.array(img)
     if arr.ndim != 3 or arr.shape[-1] != 3:
@@ -250,41 +284,48 @@ def _apply_person_mask_yolo_sam(
     if not bboxes:
         return img
     x1, y1, x2, y2 = bboxes[0]
-    # 작은 인물일 때 crop이 너무 작으면 SAM 입력이 비정상적으로 작아질 수 있음 → 최소 크기만큼 패딩
     cw, ch = x2 - x1, y2 - y1
+    # bbox 패딩 (10~15%): 경계 잘림 방지, SAM box prompt에 여유 부여
+    pad_ratio = YOLO_SAM_BBOX_PADDING_RATIO
+    pad_w = int(cw * pad_ratio)
+    pad_h = int(ch * pad_ratio)
+    x1 = max(0, x1 - pad_w)
+    y1 = max(0, y1 - pad_h)
+    x2 = min(W, x2 + pad_w)
+    y2 = min(H, y2 + pad_h)
+    # 최소 crop 크기 (매우 작은 bbox 대비)
     min_side = YOLO_SAM_MIN_CROP_SIDE
-    if cw < min_side or ch < min_side:
-        pad_w = max(0, (min_side - cw + 1) // 2)
-        pad_h = max(0, (min_side - ch + 1) // 2)
+    if (x2 - x1) < min_side or (y2 - y1) < min_side:
+        pad_w = max(0, (min_side - (x2 - x1) + 1) // 2)
+        pad_h = max(0, (min_side - (y2 - y1) + 1) // 2)
         x1 = max(0, x1 - pad_w)
         y1 = max(0, y1 - pad_h)
         x2 = min(W, x2 + pad_w)
         y2 = min(H, y2 + pad_h)
-    crop = img.crop((x1, y1, x2, y2))
-    crop_arr = np.array(crop)
-    if crop_arr.size == 0:
-        return img
 
+    # SamPredictor: 전체 이미지에 set_image 후 box prompt로 단일 마스크 예측
     import torch
 
+    sam_predictor.set_image(arr)
+    box_xyxy = np.array([x1, y1, x2, y2], dtype=np.float32)
     with torch.no_grad():
-        masks = mask_generator.generate(crop_arr)
-    if not masks:
+        masks, _scores, _logits = sam_predictor.predict(box=box_xyxy, multimask_output=False)
+    if not masks or masks.size == 0:
         return img
-    # bbox 내부에서 area 최대 segment = 인물 (semantic은 YOLO가 이미 person으로 한정)
-    best = max(masks, key=lambda m: m["area"])
-    seg = best["segmentation"]
-    crop_mask = np.where(seg, 255, 0).astype(np.uint8)
-    # 원본 크기로 복원: bbox 밖은 0
-    full_mask = np.zeros((H, W), dtype=np.uint8)
-    full_mask[y1:y2, x1:x2] = crop_mask
-    alpha = full_mask
-    if SAM_ALPHA_THRESHOLD > 0:
-        alpha = np.where(alpha >= SAM_ALPHA_THRESHOLD, 255, 0).astype(np.uint8)
-    if SAM_USE_EROSION:
-        pil_alpha = Image.fromarray(alpha)
-        pil_alpha = pil_alpha.filter(ImageFilter.MinFilter(size=3))
-        alpha = np.array(pil_alpha)
+    mask = masks[0]  # (H, W) bool
+    alpha = np.where(mask, 255, 0).astype(np.uint8)
+
+    # Morphological closing: 내부 구멍 제거 (dilate → erode) → 인물을 하나의 solid mask로
+    try:
+        import cv2  # type: ignore[import-untyped]
+
+        k = YOLO_SAM_CLOSING_KERNEL_SIZE
+        if k >= 3:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, kernel)
+    except ImportError:
+        pass  # cv2 없으면 closing 생략
+
     bg = Image.new("RGB", img.size, BACKGROUND_RGB)
     rgb = img.convert("RGB")
     out = Image.composite(rgb, bg, Image.fromarray(alpha))
@@ -345,7 +386,8 @@ def run(
         print(f"[Stage1] Limiting to first {len(paths)} image(s) (max_images={limit})", flush=True)
 
     yolo_model: Any = None
-    sam_generator: Any = None
+    sam_predictor: Any = None  # --use-yolo-sam: box prompt용 (옵션 A)
+    sam_generator: Any = None  # --use-sam: automatic mask generator용
 
     if use_yolo_sam:
         if not HAS_YOLO:
@@ -360,14 +402,14 @@ def run(
         yolo_model = _load_yolo_model()
         if yolo_model is None:
             raise RuntimeError(f"YOLO model could not be loaded: {YOLO_MODEL}")
-        print("[Stage1] Loading SAM model (GPU)...", flush=True)
-        sam_generator = _create_sam_mask_generator()
-        if sam_generator is None:
+        print("[Stage1] Loading SAM predictor (GPU, box prompt)...", flush=True)
+        sam_predictor = _create_sam_predictor()
+        if sam_predictor is None:
             raise FileNotFoundError(
                 f"SAM checkpoint not found at {SAM_CHECKPOINT_PATH}. "
                 "Download from https://github.com/facebookresearch/segment-anything#model-checkpoints"
             )
-        print("[Stage1] YOLO+SAM ready.", flush=True)
+        print("[Stage1] YOLO+SAM ready (Option A: predictor + closing).", flush=True)
     elif use_sam:
         if not HAS_SAM:
             raise RuntimeError(
@@ -390,8 +432,8 @@ def run(
         img = _resize_max_side(img, max_size)
         if color_normalize:
             img = _color_normalize_simple(img)
-        if use_yolo_sam and yolo_model is not None and sam_generator is not None:
-            img = _apply_person_mask_yolo_sam(img, yolo_model, sam_generator)
+        if use_yolo_sam and yolo_model is not None and sam_predictor is not None:
+            img = _apply_person_mask_yolo_sam(img, yolo_model, sam_predictor)
         elif use_sam and sam_generator is not None:
             img = _apply_person_mask_sam(img, sam_generator)
         elif use_person_mask:
