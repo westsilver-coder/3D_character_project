@@ -193,6 +193,7 @@ def _render_one_view(
         sh_degree=gaussians.sh_degree,
         campos=campos,
         prefiltered=False,
+        antialiasing=False,
         debug=False,
     )
     rasterizer = rasterizer_fn(settings)

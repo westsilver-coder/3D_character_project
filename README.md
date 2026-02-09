@@ -41,11 +41,6 @@
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 3  │  (폐기) geometry 변형 없음 — 스킵                           │
-└───────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────────────────┐
 │  Stage 4  │  Stylized Rendering (appearance만 변경)                    │
 │  Style    │  checkpoint → 셀 셰이딩·색상 양자화 → 스타일화 이미지/영상  │
 └───────────────────────────────────────────────────────────────────────┘
@@ -83,7 +78,7 @@
 | 4 | Stage 2c: `gs/train_3dgs.py` | 3DGS 학습 → checkpoint (실사 형상 복원). |
 | 5 | `gs/render_character.py` + `pipeline/stage4_style.py` | **Stage 4:** checkpoint → 셀 셰이딩·색상 양자화 → 스타일화 렌더 출력. |
 
-**정리:** 파이프라인 = Stage 1 → 2a → 2b → 2c → Stage 4(스타일화 렌더). Stage 3은 폐기(더미). 결과는 렌더 이미지를 눈으로 확인하며 `--cel-bands`, `--color-levels` 등으로 튜닝 가능.
+**정리:** 파이프라인 = Stage 1 → 2a → 2b → 2c → Stage 4(스타일화 렌더). 결과는 렌더 이미지를 눈으로 확인하며 `--cel-bands`, `--color-levels` 등으로 튜닝 가능.
 
 ---
 
@@ -166,15 +161,6 @@
 
 ---
 
-### Stage 3 — (폐기)
-
-| 구분 | 내용 |
-|------|------|
-| **상태** | **사용하지 않음.** geometry 변형 없음. |
-| **구현** | `pipeline/stage3_deform.py` (실행 시 안내만 출력 후 종료) |
-
----
-
 ### Stage 4 — Stylized Rendering (파이프라인 최종 단계)
 
 | 구분 | 내용 |
@@ -200,22 +186,16 @@ project/
 │   └── gs_checkpoints/      # Stage 2c: train_3dgs checkpoint
 │
 ├── docs/
-│   ├── STAGE2_HUMAN_PRIOR.md  # Stage 2 설계: 2a/2b/2c, geometry 기준
-│   └── PROJECT_DIRECTION.md   # 프로젝트 목표 재정의, 수정 대상 최소 목록, Stage 4 로드맵
+│   └── STAGE2_HUMAN_PRIOR.md  # Stage 2 설계: 2a/2b/2c, geometry 기준
 │
 ├── gs/                      # 3DGS·렌더
 │   ├── init_3dgs.py         # Stage 2b: 3DGS 초기화 전용
 │   ├── train_3dgs.py        # Stage 2c: 3DGS 학습
 │   └── render_character.py  # Stage 4: 스타일화 렌더 (셀 셰이딩·색상 양자화)
 │
-├── character/               # 규칙·프리셋 정의
-│   ├── deformation_rules.py # 데포르메 규칙 로드/검증 (JSON·dict)
-│   └── style_presets.py     # Stage 4용 스타일 프리셋
-│
 ├── pipeline/                # Stage 진입점 (순차 실행)
 │   ├── stage1_preprocess.py # Stage 1
 │   ├── stage2_reconstruct.py # Stage 2a: human shape prior (no COLMAP)
-│   ├── stage3_deform.py     # Stage 3
 │   └── stage4_style.py      # Stage 4
 │
 ├── output/
@@ -225,7 +205,7 @@ project/
 └── README.md
 ```
 
-- **pipeline/** : Stage 1 → 2a → 2b → 2c → Stage 4. Stage 3은 폐기(더미).
+- **pipeline/** : Stage 1 → 2a → 2b → 2c → Stage 4.
 - **gs/** : 3DGS 초기화·학습·Stage 4 스타일화 렌더.
 - **output/stylized/** : Stage 4 출력 (스타일화된 렌더 이미지).
 
