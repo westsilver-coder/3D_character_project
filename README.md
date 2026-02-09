@@ -72,7 +72,7 @@
 |------|-----------|------|
 | 1 | `character/deformation_rules.py`, `character/style_presets.py` | 규칙·프리셋 정의만 있으면 됨. 의존성 없고 이후 Stage의 “설정 계약”이 됨. |
 | 2 | `pipeline/stage1_preprocess.py` | OpenCV/PIL 등으로 구현 가능. Stage 2 입력을 만드는 단계라 먼저 완성해야 함. |
-| 3 | `gs/train_3dgs.py` + `pipeline/stage2_reconstruct.py` | 3DGS 라이브러리 연동 필요. 가장 무거운 단계. 여기서 3D 체크포인트가 나와야 이후 단계 의미 있음. |
+| 3 | `pipeline/stage2_reconstruct.py` → `gs/train_3dgs.py` | Stage 2는 COLMAP 없이 human-prior로 mesh+카메라 생성. 3DGS는 해당 출력으로 초기화 후 학습. |
 | 4 | `gs/deform_geometry.py` + `pipeline/stage3_deform.py` | Stage 2 체크포인트를 읽어 데포르메 규칙 적용. |
 | 5 | `pipeline/stage4_style.py` + `character/style_presets.py` 활용 | 기하 유지한 채 색·스타일만 변경. |
 | 6 | `gs/render_character.py` | 최종 뷰/영상 출력. |
@@ -123,15 +123,16 @@
 
 ---
 
-### Stage 2 — 실사 인물 3D 구조 복원 (3D Vision 핵심)
+### Stage 2 — Human-Prior 기반 3D 복원 (COLMAP 미사용)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | 실사 인물의 기하(geometry)를 최대한 보존한 3D 표현 생성 |
+| **목적** | 인체 prior(ROMP/SMPL 또는 synthetic 카메라)로 canonical mesh + per-image 카메라 생성. deformation/stylization 가능한 기하 구조 제공 |
 | **입력** | Stage 1 전처리 이미지 세트 |
-| **처리** | 3D Gaussian Splatting(3DGS), low-resolution / low-iteration 설정. 신체 실루엣, 팔다리 위치, 전체 비율 복원 |
-| **출력** | 실사 인물 기반 3DGS 모델 체크포인트 |
-| **구현** | `gs/train_3dgs.py`, `pipeline/stage2_reconstruct.py` |
+| **처리** | 단일 이미지 인체 추정(ROMP 등) 또는 synthetic 원형 궤도 카메라. Canonical body space 기준 mesh + cameras.json |
+| **출력** | `data/human_prior/` — canonical_mesh.ply, cameras.json, image_list.txt → 3DGS 초기화용 |
+| **구현** | `pipeline/stage2_reconstruct.py`, `gs/train_3dgs.py` |
+| **설계** | Geometry 기준·3DGS 연결 방법: `docs/STAGE2_HUMAN_PRIOR.md` 참고 |
 
 ---
 
@@ -177,11 +178,16 @@
 project/
 ├── data/
 │   ├── raw_images/          # 원본 전신 인물 이미지 (20~40장)
-│   └── processed_images/    # Stage 1 전처리 결과
+│   ├── processed_images/    # Stage 1 전처리 결과
+│   ├── human_prior/         # Stage 2 출력 (no COLMAP): canonical_mesh.ply, cameras.json
+│   └── gs_output/           # 3DGS 초기화 결과
+│
+├── docs/
+│   └── STAGE2_HUMAN_PRIOR.md # Stage 2 설계: geometry 기준, 3DGS 연결
 │
 ├── gs/                      # 3DGS 관련 코어
-│   ├── train_3dgs.py        # Stage 2: 3DGS 학습
-│   ├── deform_geometry.py  # Stage 3: 기하 데포르메
+│   ├── train_3dgs.py        # Human-prior 기반 3DGS 초기화·학습
+│   ├── deform_geometry.py   # Stage 3: 기하 데포르메
 │   └── render_character.py  # Stage 5: 렌더링·영상 출력
 │
 ├── character/               # 규칙·프리셋 정의
@@ -190,7 +196,7 @@ project/
 │
 ├── pipeline/                # Stage 진입점 (순차 실행)
 │   ├── stage1_preprocess.py # Stage 1
-│   ├── stage2_reconstruct.py# Stage 2
+│   ├── stage2_reconstruct.py # Stage 2 (human-prior, no COLMAP)
 │   ├── stage3_deform.py     # Stage 3
 │   └── stage4_style.py      # Stage 4
 │

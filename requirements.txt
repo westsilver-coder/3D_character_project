@@ -15,3 +15,6 @@ segment-anything
 
 # Utils
 tqdm
+
+# Stage 2 human-prior (optional): pip install simple-romp
+# ROMP 없으면 synthetic 카메라 + placeholder mesh로 동작

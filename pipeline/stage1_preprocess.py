@@ -1,8 +1,8 @@
 """
-Stage 1: COLMAP / 3D Gaussian Splatting 입력용 이미지 전처리.
+Stage 1: Human-prior / 3D Gaussian Splatting 입력용 이미지 전처리.
 
 목표는 "예쁜 컷아웃"이 아니라 foreground(인물) 실루엣 안정성.
-불안정한 마스크(사람 없음, 배경만 남음)는 저장하지 않아 COLMAP feature가
+불안정한 마스크(사람 없음, 배경만 남음)는 저장하지 않아 Stage 2 인체 추정이
 배경에 묻지 않도록 함.
 """
 
@@ -30,7 +30,7 @@ COLOR_NORMALIZE = True
 SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 MAX_IMAGES = None  # 테스트용: N이면 처음 N장만 처리
 
-# rembg 마스크 검증: COLMAP에 사람 없는/배경만 남은 프레임이 들어가는 것 방지
+# rembg 마스크 검증: Stage 2 인체 추정에 사람 없는/배경만 남은 프레임 방지
 REMBG_FG_RATIO_MIN = 0.10   # fg_area / image_area < 이 값이면 실패
 REMBG_BBOX_OVERLAP_MIN = 0.20  # person bbox 존재 시, (bbox 내 fg 픽셀)/bbox_area < 이 값이면 "rembg가 사람 놓침" → 실패
 
@@ -144,7 +144,7 @@ def _get_person_bboxes_from_seg(img: PILImage.Image, yolo_seg_model: Any) -> lis
 
 def _validate_mask(alpha: Any, img: PILImage.Image, yolo_seg_model: Any) -> bool:
     """
-    rembg 마스크 품질 검증. COLMAP에 사람 없음/배경만 남는 프레임이 들어가는 것 방지.
+    rembg 마스크 품질 검증. Stage 2 인체 추정에 사람 없음/배경만 남는 프레임 방지.
     - fg_area / image_area < REMBG_FG_RATIO_MIN → 실패
     - YOLO person bbox가 있는데, bbox 내 foreground 비율 < REMBG_BBOX_OVERLAP_MIN → rembg가 사람 놓침 → 실패
     """
@@ -332,7 +332,7 @@ def run(
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Stage 1: COLMAP/3DGS 입력용 전처리")
+    parser = argparse.ArgumentParser(description="Stage 1: Human-prior/3DGS 입력용 전처리")
     parser.add_argument("--raw", type=Path, default=RAW_IMAGES_DIR, help="원본 이미지 디렉터리")
     parser.add_argument("--out", type=Path, default=PROCESSED_IMAGES_DIR, help="출력 디렉터리")
     parser.add_argument("--max-size", type=int, default=MAX_SIZE_PX, help="긴 변 최대 픽셀")
