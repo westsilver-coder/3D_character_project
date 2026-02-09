@@ -15,6 +15,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Headless(Colab 등) 환경: Qt/OpenGL context 오류 방지
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 # -----------------------------------------------------------------------------
 # 경로
 # -----------------------------------------------------------------------------
@@ -34,12 +37,13 @@ SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 CAMERA_MODEL = "SIMPLE_PINHOLE"
 SINGLE_CAMERA = True
 
-# Feature extractor
+# Feature extractor (SiftExtraction.* — COLMAP 3.7+ 문법)
+# headless 환경에서 OpenGL context 생성 실패를 피하기 위해 CPU 고정
 FEATURE_EXTRACTOR_MAX_IMAGE_SIZE = 3200
-FEATURE_EXTRACTOR_USE_GPU = 1
+FEATURE_EXTRACTOR_USE_GPU = 0  # 0=CPU only (Colab/headless 안정 동작)
 SIFT_MAX_NUM_FEATURES = 8192
 
-# Matcher (exhaustive_matcher)
+# Matcher (exhaustive_matcher): GPU 사용 가능 시 1 유지
 FEATURE_MATCHING_USE_GPU = 1
 
 # Mapper
@@ -85,12 +89,14 @@ def run_command(
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    """COLMAP subprocess 실행. 실패 시 CalledProcessError."""
+    """COLMAP subprocess 실행. headless 환경을 위해 QT_QPA_PLATFORM 보장."""
     cmd = [str(exe)] + args
+    proc_env = (os.environ if env is None else {**os.environ, **env}).copy()
+    proc_env.setdefault("QT_QPA_PLATFORM", "offscreen")
     return subprocess.run(
         cmd,
         cwd=cwd,
-        env=env or os.environ,
+        env=proc_env,
         capture_output=True,
         check=False,
         timeout=3600,
