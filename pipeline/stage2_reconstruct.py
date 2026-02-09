@@ -18,6 +18,11 @@ from typing import Any
 
 import numpy as np
 
+if 'chumpy' not in sys.modules:
+    chumpy = types.ModuleType("chumpy")
+    sys.modules["chumpy"] = chumpy
+    sys.modules["chumpy.ch"] = chumpy
+
 # -----------------------------------------------------------------------------
 # 경로
 # -----------------------------------------------------------------------------
