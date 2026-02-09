@@ -1,4 +1,4 @@
-# 실사 전신 인물 → 템플릿 기반 애니 캐릭터 생성 시스템
+# 실사 전신 인물 → 반실사 애니 피규어 스타일 3D 미니어처
 
 **3D Vision / 3DGS 기반** · Python · Google Colab (T4 GPU)
 
@@ -6,7 +6,7 @@
 
 ## 한 줄 요약
 
-실사 전신 이미지를 입력으로 **사람의 구조적 정보(키, 체형, 실루엣, 의상 색 등)** 만 추출하고, **고정된 애니 스타일 캐릭터 템플릿(마네킹)** 위에 이를 매핑하여 **귀엽고 일관된 애니/피규어 스타일** 3D 캐릭터를 생성하는 파이프라인. (실사 이미지를 직접 캐릭터처럼 변형하는 방식이 아님.)
+실사 전신 이미지를 입력으로 **3DGS로 실사 비율의 3D 복원**을 한 뒤, **geometry는 그대로 두고 렌더링 스타일만** 적용하여 **일본 애니메이션 피규어/굿즈 같은 반실사(stylized realism) 3D 미니어처**를 생성하는 파이프라인. (캐릭터화/SD·치비 템플릿이 아님.)
 
 ---
 
@@ -36,30 +36,27 @@
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │  Stage 2c │  3DGS 학습 (train_3dgs.py) — GT 이미지로 Gaussian 학습    │
-│  Train    │  → 3DGS checkpoint                                         │
+│  Train    │  → 3DGS checkpoint (실사 형상 + 의상 복원)                  │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 3  │  템플릿에 적용할 비율/스케일 조건 정리 (데포르메 규칙 활용)│
-│  Conditions│ → 조건 데이터 (최종 캐릭터 geometry 직접 생성 아님)       │
+│  Stage 3  │  (폐기) geometry 변형 없음 — 스킵                           │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 4  │  템플릿(PLY) 로드 + Stage 3 조건 적용                      │
-│  Final    │  → 렌더 가능한 캐릭터 geometry/appearance (파이프라인 최종) │
+│  Stage 4  │  Stylized Rendering (appearance만 변경)                    │
+│  Style    │  checkpoint → 셀 셰이딩·색상 양자화 → 스타일화 이미지/영상  │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
-[파이프라인 출력] 애니/피규어 스타일 3D 캐릭터 (PLY 등)
+[파이프라인 출력] 반실사 애니 피규어 스타일 렌더 결과 (이미지/턴테이블)
 
-  ※ 렌더링은 pipeline 단계 아님. 필요 시 gs/render_character.py 로 선택 수행.
+  ※ Colab GPU 있을 때 고품질 렌더, 없을 때는 --dummy 로 파이프라인·파라미터 확인 가능.
 ```
 
-**핵심:** 파이프라인은 Stage 4까지. Stage 4 출력 = 렌더 가능한 캐릭터. 템플릿 `character/templates/sd_chibi_base.ply` 고정. Stage 5 없음. 렌더링은 gs/render_character.py 선택 수행.
-
-**설계 원칙:** Stage 3은 조건(dict)만 정리, Stage 4가 최종 캐릭터 생성. Stage 5 없음. 렌더링은 선택.
+**핵심:** geometry는 Stage 2c까지로 확정. Stage 4는 **렌더 스타일만** 적용(셀 셰이딩, 색 단순화). Blender/PLY 템플릿/프로시저얼 얼굴 없음. 결과는 눈으로 확인 가능한 렌더링 출력.
 
 ---
 
@@ -68,9 +65,9 @@
 | 항목 | 내용 |
 |------|------|
 | **입력** | 동일 인물 전신 이미지 20~40장, 다양한 시점 |
-| **핵심 처리** | 사람 구조 정보 추출(2a~2c) → 비율/조건 정리(3) → **템플릿 위에 매핑(4)** |
-| **출력** | 귀엽고 일관된 애니/피규어 스타일 3D 캐릭터 (템플릿 기반) |
-| **환경** | Python, Google Colab, T4 · 고해상도/실시간은 목표 아님 |
+| **핵심 처리** | 3DGS 복원(2a~2c) → **Stage 4에서 appearance만 스타일화** (실사 형상 유지) |
+| **출력** | 반실사 애니 피규어/굿즈 느낌의 3D 미니어처 (렌더 이미지·영상) |
+| **환경** | Python, Google Colab (T4). GPU 없을 때는 더미 실행으로 튜닝·파이프라인 확인 |
 
 ---
 
@@ -80,15 +77,13 @@
 
 | 순서 | 구현 대상 | 이유 |
 |------|-----------|------|
-| 1 | `character/deformation_rules.py`, `character/style_presets.py` | 규칙·프리셋 정의만 있으면 됨. 의존성 없고 이후 Stage의 “설정 계약”이 됨. |
-| 2 | `pipeline/stage1_preprocess.py` | OpenCV/PIL 등으로 구현 가능. Stage 2 입력을 만드는 단계라 먼저 완성해야 함. |
-| 3 | Stage 2a: `pipeline/stage2_reconstruct.py` | Human shape prior (canonical mesh + synthetic cameras). |
-| 4 | Stage 2b: `gs/init_3dgs.py` | 3DGS 초기화 전용. point_cloud.npy, cameras.json 생성. 학습/렌더링 없음. |
-| 5 | Stage 2c: `gs/train_3dgs.py` | init_3dgs 출력 + GT 이미지로 실제 3DGS 학습 → checkpoint 저장. |
-| 6 | `gs/deform_geometry.py` + `pipeline/stage3_deform.py` | Stage 2/3 조건: 템플릿에 적용할 비율/스케일 정리. |
-| 7 | `pipeline/stage4_style.py` | **템플릿 로드 + Stage 3 조건 적용** → 렌더 가능한 캐릭터 geometry/appearance (파이프라인 최종). |
+| 1 | `pipeline/stage1_preprocess.py` | Stage 2 입력용 전처리 이미지. |
+| 2 | Stage 2a: `pipeline/stage2_reconstruct.py` | Human shape prior (canonical mesh + synthetic cameras). |
+| 3 | Stage 2b: `gs/init_3dgs.py` | 3DGS 초기화. point_cloud.npy, cameras.json. |
+| 4 | Stage 2c: `gs/train_3dgs.py` | 3DGS 학습 → checkpoint (실사 형상 복원). |
+| 5 | `gs/render_character.py` + `pipeline/stage4_style.py` | **Stage 4:** checkpoint → 셀 셰이딩·색상 양자화 → 스타일화 렌더 출력. |
 
-**정리:** 파이프라인 = Stage 1 → 2a→2b→2c → Stage 3(조건 정리) → Stage 4(최종 캐릭터 생성). 렌더링은 **선택** → `gs/render_character.py`.
+**정리:** 파이프라인 = Stage 1 → 2a → 2b → 2c → Stage 4(스타일화 렌더). Stage 3은 폐기(더미). 결과는 렌더 이미지를 눈으로 확인하며 `--cel-bands`, `--color-levels` 등으로 튜닝 가능.
 
 ---
 
@@ -115,7 +110,7 @@
 
 **정리:**
 
-- **동일 인물 + 동일 의상 + 여러 각도(20~40장)** → **몸과 옷이 함께** 3D로 복원되고, 이후 데포르메·스타일을 적용하면 **옷 입은 캐릭터 미니어처**가 된다.
+- **동일 인물 + 동일 의상 + 여러 각도(20~40장)** → **몸과 옷이 함께** 3D로 복원되고, Stage 4에서 스타일화 렌더를 적용하면 **옷 입은 반실사 미니어처**가 된다.
 - `data/raw_images/` 에 그 조건을 만족하는 이미지만 넣어두면 된다.
 
 ---
@@ -171,37 +166,25 @@
 
 ---
 
-### Stage 3 — 템플릿에 적용할 조건 정리 (역할 축소)
+### Stage 3 — (폐기)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | 최종 캐릭터를 만드는 단계가 아니라, **템플릿에 적용할 비율/스케일 조건**을 정리하는 단계 |
-| **입력** | Stage 2c 체크포인트(condition 정보), 데포르메 규칙(JSON/dict) |
-| **처리** | 데포르메 규칙을 활용해 비율·스케일 조건 정리. (머리/팔/다리 등 스케일) — Stage 4에서 템플릿에 적용 |
-| **출력** | 조건 데이터 (템플릿 매핑용). 최종 캐릭터 geometry는 Stage 4에서 생성 |
-| **구현** | `gs/deform_geometry.py`, `pipeline/stage3_deform.py`, `character/deformation_rules.py` |
+| **상태** | **사용하지 않음.** geometry 변형 없음. |
+| **구현** | `pipeline/stage3_deform.py` (실행 시 안내만 출력 후 종료) |
 
 ---
 
-### Stage 4 — 최종 캐릭터 생성 (파이프라인 마지막 단계)
+### Stage 4 — Stylized Rendering (파이프라인 최종 단계)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | 고정 템플릿(sd_chibi_base.ply) 로드 → Stage 3 조건 적용 → **렌더 가능한** 애니/피규어 스타일 캐릭터 geometry/appearance 생성 |
-| **입력** | 템플릿 PLY(`character/templates/sd_chibi_base.ply`), Stage 3 조건(dict/JSON) |
-| **처리** | 템플릿 로드 → 비율/스케일 델타 적용. 실사 눈/코/입 미사용. |
-| **출력** | 렌더 가능한 캐릭터 geometry/appearance (예: `output/characters/` 에 PLY 등) |
-| **구현** | `pipeline/stage4_style.py` |
-
----
-
-### 렌더링 (파이프라인 단계 아님, 선택 사항)
-
-| 구분 | 내용 |
-|------|------|
-| **역할** | Stage 4 이후, 필요 시에만 수행. 턴테이블 mp4·회전 뷰 등 시각화. |
-| **입력** | Stage 4 출력(렌더 가능한 캐릭터) |
-| **구현** | `gs/render_character.py` |
+| **목적** | Stage 2c 3DGS checkpoint를 **그대로** 사용해, **렌더 스타일만** 적용하여 반실사 애니 피규어 느낌의 결과 생성 |
+| **입력** | 3DGS checkpoint (`data/gs_checkpoints/`), `data/gs_output/cameras.json` |
+| **처리** | Diffuse 중심 렌더 → 셀 셰이딩(명암 양자화) → 색상 단순화(quantization, saturation/contrast). geometry 수정 없음. |
+| **출력** | 스타일화된 렌더 이미지 (예: `output/stylized/`). GPU 없을 때는 `--dummy` 로 placeholder에 스타일 적용해 파이프라인·파라미터 확인 |
+| **구현** | `pipeline/stage4_style.py` (내부에서 `gs/render_character.py` 호출) |
+| **튜닝** | `--cel-bands`, `--color-levels`, `--saturation`, `--contrast` 로 눈으로 확인하며 조정 가능 |
 
 ---
 
@@ -220,11 +203,10 @@ project/
 │   ├── STAGE2_HUMAN_PRIOR.md  # Stage 2 설계: 2a/2b/2c, geometry 기준
 │   └── PROJECT_DIRECTION.md   # 프로젝트 목표 재정의, 수정 대상 최소 목록, Stage 4 로드맵
 │
-├── gs/                      # 3DGS·조건·렌더
+├── gs/                      # 3DGS·렌더
 │   ├── init_3dgs.py         # Stage 2b: 3DGS 초기화 전용
 │   ├── train_3dgs.py        # Stage 2c: 3DGS 학습
-│   ├── deform_geometry.py   # Stage 3: 조건(dict) 계산
-│   └── render_character.py  # 렌더링 (선택, pipeline 단계 아님)
+│   └── render_character.py  # Stage 4: 스타일화 렌더 (셀 셰이딩·색상 양자화)
 │
 ├── character/               # 규칙·프리셋 정의
 │   ├── deformation_rules.py # 데포르메 규칙 로드/검증 (JSON·dict)
@@ -237,54 +219,49 @@ project/
 │   └── stage4_style.py      # Stage 4
 │
 ├── output/
-│   ├── characters/          # 최종 캐릭터 결과
-│   └── videos/              # 턴테이블 mp4 등
+│   ├── stylized/             # Stage 4 스타일화 렌더 이미지
+│   └── videos/               # 턴테이블 mp4 등 (선택)
 │
 └── README.md
 ```
 
-- **pipeline/** : Stage 1~4 순서 실행. **Stage 5는 없음** (렌더링은 gs/render_character.py 선택 실행).
-- **gs/** : 3DGS 학습·조건 계산·렌더링(선택) 구현.
-- **character/** : 데포르메 규칙·템플릿·프리셋 등 설정.
+- **pipeline/** : Stage 1 → 2a → 2b → 2c → Stage 4. Stage 3은 폐기(더미).
+- **gs/** : 3DGS 초기화·학습·Stage 4 스타일화 렌더.
+- **output/stylized/** : Stage 4 출력 (스타일화된 렌더 이미지).
 
 ---
 
-## 사용자 정의 데포르메 설정
+## Stage 4 스타일 파라미터
 
-데포르메 규칙은 **JSON** 또는 **Python dict**로 정의한다.
+| 파라미터 | 기본값 | 설명 |
+|----------|--------|------|
+| `--cel-bands` | 3 | 셀 셰이딩 단계 수 (2~4). 클수록 명암 계단이 많음. |
+| `--color-levels` | 6 | RGB 양자화 단계. 작을수록 플라스틱 피규어 느낌. |
+| `--saturation` | 1.0 | 채도. |
+| `--contrast` | 1.05 | 대비. |
 
-```json
-{
-  "head_scale": 1.4,
-  "arm_length": 0.8,
-  "leg_length": 0.85,
-  "torso_scale": 0.9,
-  "style": "2.5D_character"
-}
-```
-
-`character/deformation_rules.py`에서 로드·검증 후 Stage 3에서 사용.
+렌더 결과를 눈으로 보면서 위 파라미터를 조정해 원하는 반실사 톤을 맞출 수 있다.
 
 ---
 
 ## MVP 성공 조건
 
-- [ ] 전신 인물 사진 → 3DGS 복원 성공
-- [ ] 데포르메 규칙이 실제 기하 구조에 반영됨
-- [ ] 실사가 아닌 **캐릭터화된** 3D 인물 생성
-- [ ] 결과를 회전하여 시각적으로 확인 가능
+- [ ] 전신 인물 사진 → 3DGS 복원 성공 (Stage 1~2c)
+- [ ] Stage 4 스타일화 렌더 출력 (셀 셰이딩·색상 단순화)
+- [ ] **실사 형상 유지** + 애니 피규어/굿즈 느낌의 시각 결과
+- [ ] GPU 없을 때 `--dummy` 로 파이프라인·파라미터 확인 가능
 
 ---
 
 ## 설계 원칙
 
-- **CV / 3D Vision 중심** — 2D→3D, 기하 변형, 렌더링에 집중
-- **Geometry vs Appearance 분리** — Stage 3(기하) / Stage 4(외형) 명확히 구분
-- **재현 가능한 파이프라인 우선** — 완벽한 품질보다 “끝까지 동작하는 흐름”
-- **파라미터 조절** — 모든 주요 파라미터는 코드 상단에서 설정 가능
+- **Geometry 유지, Appearance만 변경** — Stage 4는 렌더 스타일만 적용. PLY/템플릿 생성 없음.
+- **Blender 미사용** — 모든 작업은 Python + 3DGS + 렌더 코드로 처리.
+- **재현 가능한 파이프라인** — 끝까지 동작하는 흐름 우선. Colab GPU 있을 때 고품질, 없을 때 더미 허용.
+- **파라미터 조절** — --cel-bands, --color-levels 등으로 눈으로 확인하며 튜닝
 
 ---
 
 ## 최종 결과 정의
 
-> “실사 전신 인물을 촬영하면, 사용자가 정의한 캐릭터 규칙에 따라 3D 캐릭터로 변환해주는 3D 비전 시스템”
+> “실사 전신 인물을 촬영하면, 3DGS로 실사 비율의 3D를 복원하고, 렌더 스타일만 바꿔 **반실사 애니메이션 피규어/굿즈 스타일 3D 미니어처**를 만드는 3D 비전 시스템”
