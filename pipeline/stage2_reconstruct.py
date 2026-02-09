@@ -182,20 +182,18 @@ def load_smpl_canonical_tpose(
     shapedirs = shapedirs.astype(np.float64)
     faces = _to_numpy(model.get("f", model.get("faces", []))).astype(np.int32)
 
+    num_betas = shapedirs.shape[1]
     if beta is None:
-        beta = np.zeros(10, dtype=np.float64)
+        beta = np.zeros(num_betas, dtype=np.float64)
     else:
-        beta = np.asarray(beta, dtype=np.float64).flatten()[:10]
-        if len(beta) < 10:
-            beta = np.pad(beta, (0, 10 - len(beta)))
+        beta = np.asarray(beta, dtype=np.float64).flatten()
+        if len(beta) < num_betas:
+            beta = np.pad(beta, (0, num_betas - len(beta)))
+        elif len(beta) > num_betas:
+            beta = beta[:num_betas]
 
-    # V = v_template + shapedirs @ beta. shapedirs: (6890*3, K) or (6890, 3, K) already flattened
-    K = shapedirs.shape[1]
-    beta = beta[:K]
-    if shapedirs.shape[0] == v_template.size:
-        v_shaped = v_template + (shapedirs @ beta).reshape(-1, 3)
-    else:
-        v_shaped = v_template + (shapedirs @ beta).reshape(v_template.shape)
+    # V = v_template + (shapedirs @ beta).reshape(-1, 3); shapedirs (6890*3, num_betas)
+    v_shaped = v_template + (shapedirs @ beta).reshape(-1, 3)
     vertices = np.ascontiguousarray(v_shaped.astype(np.float32))
     return vertices, faces
 
