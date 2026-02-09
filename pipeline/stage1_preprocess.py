@@ -92,7 +92,9 @@ def _color_normalize_simple(img: PILImage.Image) -> PILImage.Image:
 
 def _apply_rembg_mask(img: PILImage.Image) -> tuple[PILImage.Image, Any]:
     """
-    rembg로 전경 마스크 적용. 배경을 BACKGROUND_RGB로 교체.
+    rembg로 전경 마스크(alpha)만 추출하고, 원본 img.size 기준으로만 합성.
+    - rembg RGBA 출력 크기가 img와 다를 수 있음(crop/리사이즈) → RGB는 사용하지 않음.
+    - alpha만 사용해 img 위에 배경 합성 → 출력은 항상 img와 동일 해상도·비율.
     반환: (합성 RGB 이미지, alpha numpy (H,W) uint8 0/255). rembg 없으면 (원본, None).
     """
     from PIL import Image
@@ -101,12 +103,15 @@ def _apply_rembg_mask(img: PILImage.Image) -> tuple[PILImage.Image, Any]:
     rgba = rembg_remove(img, alpha_matting=False)
     if rgba.mode != "RGBA":
         return (img, None)
-    rgb = rgba.convert("RGB")
     alpha = rgba.split()[-1]
+    # rembg 출력이 crop 등으로 img.size와 다를 수 있음 → alpha만 img.size에 맞춤
+    if alpha.size != img.size:
+        alpha = alpha.resize(img.size, resample=Image.NEAREST)
     import numpy as np
     alpha_np = np.array(alpha)
     bg = Image.new("RGB", img.size, BACKGROUND_RGB)
-    out = Image.composite(rgb, bg, alpha)
+    # 원본(img) 캔버스 기준 합성: 전경=img, 배경=bg. crop/비율 깨짐 방지
+    out = Image.composite(img.convert("RGB") if img.mode != "RGB" else img, bg, alpha)
     return (out, alpha_np)
 
 
