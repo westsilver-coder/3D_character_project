@@ -43,8 +43,8 @@ FEATURE_EXTRACTOR_MAX_IMAGE_SIZE = 3200
 FEATURE_EXTRACTOR_USE_GPU = 0  # 0=CPU only (Colab/headless 안정 동작)
 SIFT_MAX_NUM_FEATURES = 8192
 
-# Matcher (exhaustive_matcher): GPU 사용 가능 시 1 유지
-FEATURE_MATCHING_USE_GPU = 1
+# Matcher (exhaustive_matcher): headless에서 OpenGL 크래시 방지 위해 CPU 고정
+FEATURE_MATCHING_USE_GPU = 0
 
 # Mapper
 MAPPER_MULTIPLE_MODELS = 0  # 단일 모델만 사용
