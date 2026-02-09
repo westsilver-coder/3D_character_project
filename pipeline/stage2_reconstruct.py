@@ -109,8 +109,8 @@ def run_feature_extractor(
         f"--image_path={image_path}",
         f"--ImageReader.camera_model={CAMERA_MODEL}",
         f"--ImageReader.single_camera={1 if SINGLE_CAMERA else 0}",
-        f"--FeatureExtraction.max_image_size={FEATURE_EXTRACTOR_MAX_IMAGE_SIZE}",
-        f"--FeatureExtraction.use_gpu={FEATURE_EXTRACTOR_USE_GPU}",
+        f"--SiftExtraction.max_image_size={FEATURE_EXTRACTOR_MAX_IMAGE_SIZE}",
+        f"--SiftExtraction.use_gpu={FEATURE_EXTRACTOR_USE_GPU}",
         f"--SiftExtraction.max_num_features={SIFT_MAX_NUM_FEATURES}",
     ]
     proc = run_command(colmap_exe, args)
