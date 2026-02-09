@@ -205,7 +205,7 @@ def _render_one_view(
         opacities=opacity.unsqueeze(0),
         scales=scales.unsqueeze(0),
         rotations=quats.unsqueeze(0),
-        cov3Ds_precomp=cov3D.unsqueeze(0),
+        # cov3Ds_precomp=cov3D.unsqueeze(0),
     )
     return out.squeeze(0)
 
