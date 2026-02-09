@@ -1,5 +1,10 @@
 # Stage 2: Human-Prior 기반 3D 복원 (COLMAP 제거)
 
+Stage 2는 **2a(prior) → 2b(초기화) → 2c(학습)** 로 명확히 분리된다.  
+기존에 “train_3dgs”가 초기화만 담당했던 부분은 **init_3dgs.py(2b)** 로, 실제 3DGS 학습은 **train_3dgs.py(2c)** 로 정리된다.
+
+---
+
 ## 1. 설계 배경
 
 - **COLMAP 한계**: rigid SfM 기반이라 사람(non-rigid) 중심 장면에서 camera=1 등 구조적 실패가 빈번함.
@@ -21,39 +26,43 @@
 
 ---
 
-## 3. Stage 2 입출력 (Human-Prior 버전)
+## 3. Stage 2 단계별 구분 (2a / 2b / 2c)
 
-### 입력
-- **Stage 1 출력**: `data/processed_images/` (전처리된 전신 인물 이미지)
+### Stage 2a — Human shape prior 생성
+- **입력**: Stage 1 출력 `data/processed_images/` (이미지 목록·해상도만 사용)
+- **출력**: `data/human_prior/` — canonical_mesh.ply (~6890 verts), cameras.json, image_list.txt
+- **처리**: SMPL_NEUTRAL.pkl 로드 → T-pose mesh. Synthetic orbit 카메라 생성. ROMP/COLMAP 없음.
+- **구현**: `pipeline/stage2_reconstruct.py`
 
-### 출력 (기본: `data/human_prior/`)
-- **`canonical_mesh.ply`**: SMPL T-pose 메시 (vertices ~6890). `SMPL_NEUTRAL.pkl`에서 직접 생성. Stage 3 Gaussian 초기화용.
-- **`cameras.json`**: Synthetic orbit 카메라 (K, R, t). 3DGS 학습용.
-- **`image_list.txt`**: 사용된 이미지 파일명 목록 (순서 일치).
+### Stage 2b — 3DGS 초기화 (학습·렌더링 없음)
+- **입력**: `data/human_prior/` (canonical_mesh.ply, cameras.json, image_list.txt)
+- **출력**: `data/gs_output/` — point_cloud.npy, cameras.json, image_list.txt
+- **처리**: mesh 표면 샘플링 → 초기 Gaussian 중심. **optimizer, loss, 렌더링 미포함**
+- **구현**: `gs/init_3dgs.py`
 
-### 처리 흐름
-1. **SMPL 로드**: `SMPL_NEUTRAL.pkl` 직접 로드 → canonical T-pose 메시 → PLY 저장.
-2. **Synthetic 카메라**: 입력 이미지 목록·해상도로 원형 궤도 카메라 생성 → cameras.json, image_list.txt.
-3. ROMP/COLMAP 없음. Stage 2 = human shape prior 생성.
-
----
-
-## 4. 3D Gaussian Splatting 초기화 연결
-
-- **카메라**: `data/human_prior/cameras.json` + `image_list.txt` → 3DGS가 각 학습 이미지의 viewpoint로 사용.
-- **초기 3D 점/가우시안**:
-  - **권장**: `canonical_mesh.ply` 표면(및 약간 바깥)에서 점 샘플링 → 이 위치를 초기 Gaussian 중심으로 사용. (정확한 포토그래메트리 불필요하므로 대략적 표면이면 충분.)
-  - **대안**: SfM 없이 랜덤/균일 초기화 후 카메라만 고정하고 3DGS만 학습하는 방식도 가능.
-- **학습**: 기존 3DGS와 동일하게, 주어진 카메라와 이미지로 re-render → photo-metric loss로 최적화. COLMAP sparse points는 사용하지 않음.
-
-요약: **Human-prior Stage 2의 출력(canonical mesh + cameras.json)이 3DGS의 “geometry·view 기준”을 대체**한다.
+### Stage 2c — 3DGS 학습
+- **입력**: `data/gs_output/point_cloud.npy`, `cameras.json`, `data/processed_images/` (GT 이미지)
+- **출력**: 학습된 3DGS checkpoint (예: data/gs_checkpoints/)
+- **처리**: diff-gaussian-splatting 스타일 training loop. COLMAP 미사용. world = canonical body space.
+- **구현**: `gs/train_3dgs.py`
 
 ---
 
-## 5. 디렉터리 구조 (Stage 유지, COLMAP만 제거)
+## 4. 3DGS 초기화·학습 연결 (2b → 2c)
+
+- **2b (init_3dgs)**: `canonical_mesh.ply` 표면 샘플링 → point_cloud.npy. cameras.json, image_list.txt export. **학습·optimizer·loss·렌더링은 포함하지 않음.**
+- **2c (train_3dgs)**: point_cloud.npy + cameras.json + GT 이미지로 실제 3DGS 학습. 카메라는 이미 K, R, t로 주어지며 COLMAP 미사용. world space = canonical human body space. 학습된 checkpoint 저장.
+
+요약: **2a(prior) → 2b(초기화 전용) → 2c(학습)** 순서로, Human-prior가 3DGS의 geometry·view 기준을 대체한다.
+
+---
+
+## 5. 디렉터리 구조 (Stage 유지, COLMAP 제거)
 
 - **Stage 1**: 변경 없음. `data/processed_images/` 생성.
-- **Stage 2**: `pipeline/stage2_reconstruct.py` — COLMAP 호출 제거, human-prior 전용으로 교체. 출력은 `data/human_prior/`.
-- **Stage 3 이후**: `data/colmap/` 대신 `data/human_prior/` (및 3DGS 체크포인트)를 참조하도록만 변경.
+- **Stage 2a**: `pipeline/stage2_reconstruct.py` — 출력 `data/human_prior/`.
+- **Stage 2b**: `gs/init_3dgs.py` — 초기화 전용. 출력 `data/gs_output/`.
+- **Stage 2c**: `gs/train_3dgs.py` — 학습. checkpoint 예: `data/gs_checkpoints/`.
+- **Stage 3 이후**: `data/colmap/` 대신 `data/human_prior/`, `data/gs_output/`, checkpoint 참조.
 
-`data/colmap/`, `database.db`, `sparse/` 는 더 이상 생성·사용하지 않음.
+`data/colmap/`, `database.db`, `sparse/` 는 사용하지 않음.

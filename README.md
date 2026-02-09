@@ -1,12 +1,12 @@
-# 실사 전신 인물 → 데포르메 기반 3D 캐릭터 생성 시스템
+# 실사 전신 인물 → 템플릿 기반 애니 캐릭터 생성 시스템
 
-**3D Vision / 3D Gaussian Splatting(3DGS) 기반** · Python · Google Colab (T4 GPU)
+**3D Vision / 3DGS 기반** · Python · Google Colab (T4 GPU)
 
 ---
 
 ## 한 줄 요약
 
-전신 인물 다각도 사진(20~40장)을 넣으면 **3DGS로 3D 복원** → **사용자 정의 데포르메** → **캐릭터 스타일 적용** → **회전 렌더/영상**까지 이어지는 **동작하는 전체 파이프라인**을 구현하는 3D 비전 프로젝트.
+실사 전신 이미지를 입력으로 **사람의 구조적 정보(키, 체형, 실루엣, 의상 색 등)** 만 추출하고, **고정된 애니 스타일 캐릭터 템플릿(마네킹)** 위에 이를 매핑하여 **귀엽고 일관된 애니/피규어 스타일** 3D 캐릭터를 생성하는 파이프라인. (실사 이미지를 직접 캐릭터처럼 변형하는 방식이 아님.)
 
 ---
 
@@ -23,33 +23,43 @@
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 2  │  3DGS로 실사 인물 기하 복원 (실루엣, 팔다리, 비율)         │
-│  3D Vision│  → 3DGS 체크포인트                                          │
+│  Stage 2a │  Human shape prior (canonical mesh + synthetic cameras)   │
+│  Prior    │  → data/human_prior/                                       │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 3  │  데포르메 규칙 적용 (머리 확대, 팔/다리 축소 등)           │
-│  Geometry │  → 캐릭터 비율 3DGS geometry                               │
+│  Stage 2b │  3DGS 초기화 (init_3dgs.py) — point_cloud, cameras export │
+│  Init     │  → data/gs_output/                                         │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 4  │  스타일 적용 (2.5D, 셀 셰이딩, 파스텔 등)                  │
-│  Appearance│ → 스타일이 입혀진 3D 캐릭터                               │
+│  Stage 2c │  3DGS 학습 (train_3dgs.py) — GT 이미지로 Gaussian 학습    │
+│  Train    │  → 3DGS checkpoint                                         │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌───────────────────────────────────────────────────────────────────────┐
-│  Stage 5  │  렌더링 (회전 뷰 / 턴테이블 mp4, 단순 배경, 좁은 FOV)     │
-│  Output   │  → characters/, videos/                                    │
+│  Stage 3  │  템플릿에 적용할 비율/스케일 조건 정리 (데포르메 규칙 활용)│
+│  Conditions│ → 조건 데이터 (최종 캐릭터 geometry 직접 생성 아님)       │
 └───────────────────────────────────────────────────────────────────────┘
         │
         ▼
-[출력] 캐릭터화된 3D 인물 (회전하여 확인 가능)
+┌───────────────────────────────────────────────────────────────────────┐
+│  Stage 4  │  템플릿(PLY) 로드 + Stage 3 조건 적용                      │
+│  Final    │  → 렌더 가능한 캐릭터 geometry/appearance (파이프라인 최종) │
+└───────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+[파이프라인 출력] 애니/피규어 스타일 3D 캐릭터 (PLY 등)
+
+  ※ 렌더링은 pipeline 단계 아님. 필요 시 gs/render_character.py 로 선택 수행.
 ```
 
-**설계 원칙:** 각 Stage는 **독립 실행 가능**. Geometry(기하)와 Appearance(외형) **분리**. 파라미터는 코드 상단에서 조절.
+**핵심:** 파이프라인은 Stage 4까지. Stage 4 출력 = 렌더 가능한 캐릭터. 템플릿 `character/templates/sd_chibi_base.ply` 고정. Stage 5 없음. 렌더링은 gs/render_character.py 선택 수행.
+
+**설계 원칙:** Stage 3은 조건(dict)만 정리, Stage 4가 최종 캐릭터 생성. Stage 5 없음. 렌더링은 선택.
 
 ---
 
@@ -57,9 +67,9 @@
 
 | 항목 | 내용 |
 |------|------|
-| **입력** | 동일 인물 전신 이미지 20~40장, 360도에 가까운 다양한 시점 |
-| **핵심 처리** | 2D→3D 복원(3DGS), 사용자 정의 기하 변형, view-consistent 렌더링 |
-| **출력** | 데포르메·스타일이 적용된 3D 캐릭터 (미니어처 느낌) |
+| **입력** | 동일 인물 전신 이미지 20~40장, 다양한 시점 |
+| **핵심 처리** | 사람 구조 정보 추출(2a~2c) → 비율/조건 정리(3) → **템플릿 위에 매핑(4)** |
+| **출력** | 귀엽고 일관된 애니/피규어 스타일 3D 캐릭터 (템플릿 기반) |
 | **환경** | Python, Google Colab, T4 · 고해상도/실시간은 목표 아님 |
 
 ---
@@ -72,12 +82,13 @@
 |------|-----------|------|
 | 1 | `character/deformation_rules.py`, `character/style_presets.py` | 규칙·프리셋 정의만 있으면 됨. 의존성 없고 이후 Stage의 “설정 계약”이 됨. |
 | 2 | `pipeline/stage1_preprocess.py` | OpenCV/PIL 등으로 구현 가능. Stage 2 입력을 만드는 단계라 먼저 완성해야 함. |
-| 3 | `pipeline/stage2_reconstruct.py` → `gs/train_3dgs.py` | Stage 2는 COLMAP 없이 human-prior로 mesh+카메라 생성. 3DGS는 해당 출력으로 초기화 후 학습. |
-| 4 | `gs/deform_geometry.py` + `pipeline/stage3_deform.py` | Stage 2 체크포인트를 읽어 데포르메 규칙 적용. |
-| 5 | `pipeline/stage4_style.py` + `character/style_presets.py` 활용 | 기하 유지한 채 색·스타일만 변경. |
-| 6 | `gs/render_character.py` | 최종 뷰/영상 출력. |
+| 3 | Stage 2a: `pipeline/stage2_reconstruct.py` | Human shape prior (canonical mesh + synthetic cameras). |
+| 4 | Stage 2b: `gs/init_3dgs.py` | 3DGS 초기화 전용. point_cloud.npy, cameras.json 생성. 학습/렌더링 없음. |
+| 5 | Stage 2c: `gs/train_3dgs.py` | init_3dgs 출력 + GT 이미지로 실제 3DGS 학습 → checkpoint 저장. |
+| 6 | `gs/deform_geometry.py` + `pipeline/stage3_deform.py` | Stage 2/3 조건: 템플릿에 적용할 비율/스케일 정리. |
+| 7 | `pipeline/stage4_style.py` | **템플릿 로드 + Stage 3 조건 적용** → 렌더 가능한 캐릭터 geometry/appearance (파이프라인 최종). |
 
-**정리:** 설정(character) → 전처리(Stage 1) → 3D 복원(Stage 2)을 먼저 끝낸 뒤, 데포르메(Stage 3) → 스타일(Stage 4) → 렌더(Stage 5) 순으로 이어가면 된다.
+**정리:** 파이프라인 = Stage 1 → 2a→2b→2c → Stage 3(조건 정리) → Stage 4(최종 캐릭터 생성). 렌더링은 **선택** → `gs/render_character.py`.
 
 ---
 
@@ -123,51 +134,73 @@
 
 ---
 
-### Stage 2 — Human shape prior 생성 (COLMAP/ROMP 미사용)
+### Stage 2a — Human shape prior 생성 (COLMAP/ROMP 미사용)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | SMPL T-pose 메시 + synthetic orbit 카메라로 human shape prior 생성. Stage 3에서 mesh 표면을 Gaussian 초기화에 사용 |
+| **목적** | SMPL T-pose 메시 + synthetic orbit 카메라로 human shape prior 생성. Stage 2b에서 mesh 표면을 Gaussian 초기화에 사용 |
 | **입력** | Stage 1 전처리 이미지 디렉터리 (이미지 목록·해상도만 사용) |
 | **처리** | `SMPL_NEUTRAL.pkl` 직접 로드 → canonical T-pose mesh. 카메라는 원형 궤도(synthetic) |
 | **출력** | `data/human_prior/` — canonical_mesh.ply (~6890 verts), cameras.json, image_list.txt |
-| **SMPL 모델** | `data/smpl/SMPL_NEUTRAL.pkl` 또는 환경변수 `SMPL_MODEL_PATH` (smpl.is.tue.mpg.de에서 다운로드) |
-| **구현** | `pipeline/stage2_reconstruct.py`, `gs/train_3dgs.py` |
+| **SMPL 모델** | `data/smpl/SMPL_NEUTRAL.pkl` 또는 환경변수 `SMPL_MODEL_PATH` |
+| **구현** | `pipeline/stage2_reconstruct.py` |
 
 ---
 
-### Stage 3 — 캐릭터 데포르메 (Geometry Deformation)
+### Stage 2b — 3DGS 초기화 (학습/렌더링 없음)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | Stage 2의 3DGS geometry를 **사용자 정의 데포르메 규칙**으로 변형 (캐릭터화 핵심) |
-| **입력** | 3DGS 체크포인트, 데포르메 규칙(JSON/dict) |
-| **처리** | 머리 확대, 팔/다리 길이 축소, 몸통 단순화, 관절 중심 비선형 스케일링 등 — **기하만 변형, 스타일 아님** |
-| **출력** | 캐릭터 비율로 변형된 3DGS geometry |
+| **목적** | Human-prior 기반 3DGS **초기화 전용**. canonical_mesh.ply 표면 샘플링 → 초기 Gaussian 중심 생성 |
+| **입력** | `data/human_prior/` (canonical_mesh.ply, cameras.json, image_list.txt) |
+| **처리** | mesh 표면 샘플링 → point_cloud.npy. cameras.json, image_list.txt export. **학습·optimizer·loss·렌더링 미포함** |
+| **출력** | `data/gs_output/` — point_cloud.npy, cameras.json, image_list.txt |
+| **구현** | `gs/init_3dgs.py` |
+
+---
+
+### Stage 2c — 3DGS 학습
+
+| 구분 | 내용 |
+|------|------|
+| **목적** | init_3dgs 출력 + GT 이미지로 **실제 3D Gaussian Splatting 학습** (diff-gaussian-splatting 스타일) |
+| **입력** | `data/gs_output/point_cloud.npy`, `cameras.json`, `data/processed_images/` (GT 이미지) |
+| **처리** | Gaussian 파라미터(position, scale, rotation, opacity, SH) 학습. COLMAP 미사용. world = canonical body space |
+| **출력** | 학습된 3DGS checkpoint (예: `data/gs_checkpoints/`) |
+| **구현** | `gs/train_3dgs.py` |
+
+---
+
+### Stage 3 — 템플릿에 적용할 조건 정리 (역할 축소)
+
+| 구분 | 내용 |
+|------|------|
+| **목적** | 최종 캐릭터를 만드는 단계가 아니라, **템플릿에 적용할 비율/스케일 조건**을 정리하는 단계 |
+| **입력** | Stage 2c 체크포인트(condition 정보), 데포르메 규칙(JSON/dict) |
+| **처리** | 데포르메 규칙을 활용해 비율·스케일 조건 정리. (머리/팔/다리 등 스케일) — Stage 4에서 템플릿에 적용 |
+| **출력** | 조건 데이터 (템플릿 매핑용). 최종 캐릭터 geometry는 Stage 4에서 생성 |
 | **구현** | `gs/deform_geometry.py`, `pipeline/stage3_deform.py`, `character/deformation_rules.py` |
 
 ---
 
-### Stage 4 — 캐릭터 스타일 적용 (Appearance)
+### Stage 4 — 최종 캐릭터 생성 (파이프라인 마지막 단계)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | 기하는 유지한 채 **외형 스타일만** 변경 |
-| **입력** | Stage 3 데포르메된 3DGS |
-| **처리** | Gaussian color 수정, SH 계수로 조명/스타일 조정, 렌더링 후처리. 예: 2.5D 게임 캐릭터, 셀 셰이딩, 단순 색감, 파스텔 톤 |
-| **출력** | 스타일이 적용된 3D 캐릭터 |
-| **구현** | `pipeline/stage4_style.py`, `character/style_presets.py` |
+| **목적** | 고정 템플릿(sd_chibi_base.ply) 로드 → Stage 3 조건 적용 → **렌더 가능한** 애니/피규어 스타일 캐릭터 geometry/appearance 생성 |
+| **입력** | 템플릿 PLY(`character/templates/sd_chibi_base.ply`), Stage 3 조건(dict/JSON) |
+| **처리** | 템플릿 로드 → 비율/스케일 델타 적용. 실사 눈/코/입 미사용. |
+| **출력** | 렌더 가능한 캐릭터 geometry/appearance (예: `output/characters/` 에 PLY 등) |
+| **구현** | `pipeline/stage4_style.py` |
 
 ---
 
-### Stage 5 — 결과 렌더링 및 출력
+### 렌더링 (파이프라인 단계 아님, 선택 사항)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | 최종 3D 캐릭터를 시각적으로 확인 가능한 형태로 출력 |
-| **입력** | Stage 4 스타일 적용된 3DGS |
-| **처리** | 약간 위에서 내려다보는 시점, 좁은 FOV(미니어처 느낌), 단순 배경으로 회전 렌더 또는 턴테이블 mp4 생성 |
-| **출력** | `output/characters/`, `output/videos/` |
+| **역할** | Stage 4 이후, 필요 시에만 수행. 턴테이블 mp4·회전 뷰 등 시각화. |
+| **입력** | Stage 4 출력(렌더 가능한 캐릭터) |
 | **구현** | `gs/render_character.py` |
 
 ---
@@ -180,15 +213,18 @@ project/
 │   ├── raw_images/          # 원본 전신 인물 이미지 (20~40장)
 │   ├── processed_images/    # Stage 1 전처리 결과
 │   ├── human_prior/         # Stage 2 출력 (no COLMAP): canonical_mesh.ply, cameras.json
-│   └── gs_output/           # 3DGS 초기화 결과
+│   ├── gs_output/           # Stage 2b: init_3dgs 출력 (point_cloud, cameras)
+│   └── gs_checkpoints/      # Stage 2c: train_3dgs checkpoint
 │
 ├── docs/
-│   └── STAGE2_HUMAN_PRIOR.md # Stage 2 설계: geometry 기준, 3DGS 연결
+│   ├── STAGE2_HUMAN_PRIOR.md  # Stage 2 설계: 2a/2b/2c, geometry 기준
+│   └── PROJECT_DIRECTION.md   # 프로젝트 목표 재정의, 수정 대상 최소 목록, Stage 4 로드맵
 │
-├── gs/                      # 3DGS 관련 코어
-│   ├── train_3dgs.py        # Human-prior 기반 3DGS 초기화·학습
-│   ├── deform_geometry.py   # Stage 3: 기하 데포르메
-│   └── render_character.py  # Stage 5: 렌더링·영상 출력
+├── gs/                      # 3DGS·조건·렌더
+│   ├── init_3dgs.py         # Stage 2b: 3DGS 초기화 전용
+│   ├── train_3dgs.py        # Stage 2c: 3DGS 학습
+│   ├── deform_geometry.py   # Stage 3: 조건(dict) 계산
+│   └── render_character.py  # 렌더링 (선택, pipeline 단계 아님)
 │
 ├── character/               # 규칙·프리셋 정의
 │   ├── deformation_rules.py # 데포르메 규칙 로드/검증 (JSON·dict)
@@ -196,7 +232,7 @@ project/
 │
 ├── pipeline/                # Stage 진입점 (순차 실행)
 │   ├── stage1_preprocess.py # Stage 1
-│   ├── stage2_reconstruct.py # Stage 2 (human-prior, no COLMAP)
+│   ├── stage2_reconstruct.py # Stage 2a: human shape prior (no COLMAP)
 │   ├── stage3_deform.py     # Stage 3
 │   └── stage4_style.py      # Stage 4
 │
@@ -207,9 +243,9 @@ project/
 └── README.md
 ```
 
-- **pipeline/** : Stage 1~4를 **순서대로** 실행할 때 사용하는 스크립트.
-- **gs/** : 3DGS 학습·변형·렌더링의 실제 구현.
-- **character/** : 데포르메 규칙·스타일 프리셋 등 설정.
+- **pipeline/** : Stage 1~4 순서 실행. **Stage 5는 없음** (렌더링은 gs/render_character.py 선택 실행).
+- **gs/** : 3DGS 학습·조건 계산·렌더링(선택) 구현.
+- **character/** : 데포르메 규칙·템플릿·프리셋 등 설정.
 
 ---
 
