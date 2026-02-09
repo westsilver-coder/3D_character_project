@@ -1,17 +1,17 @@
 """
-Stage 2: Human-Prior 기반 3D 복원 (COLMAP 미사용).
+Stage 2: Human shape prior 생성 (COLMAP / ROMP 미사용).
 
-- 입력: Stage 1 출력 data/processed_images/
-- 처리: 인체 prior(ROMP/SMPL 또는 synthetic 카메라)로 canonical mesh + per-image 카메라 생성
-- 출력: data/human_prior/ (canonical_mesh.ply, cameras.json, image_list.txt)
-- 목표: deformation/stylization 가능한 기하 구조, 3DGS 초기화용 뷰 제공
+- 입력: Stage 1 출력 data/processed_images/ (이미지 목록·해상도만 사용)
+- 처리: SMPL_NEUTRAL.pkl 직접 로드 → canonical T-pose mesh. 카메라는 synthetic orbit.
+- 출력: data/human_prior/ (canonical_mesh.ply ~6890 verts, cameras.json, image_list.txt)
 
-Geometry 기준: Canonical body space (T-pose, 원점=몸 중심). 자세한 설계는 docs/STAGE2_HUMAN_PRIOR.md 참고.
+Stage 3(gs/train_3dgs.py)에서 이 mesh 표면을 Gaussian 초기화에 사용.
 """
 
 from __future__ import annotations
 
 import json
+import pickle
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,15 +24,15 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROCESSED_IMAGES_DIR = PROJECT_ROOT / "data" / "processed_images"
 HUMAN_PRIOR_DIR = PROJECT_ROOT / "data" / "human_prior"
+# SMPL 모델: 프로젝트 내 data/smpl/ 또는 환경변수 SMPL_MODEL_PATH
+SMPL_MODEL_DIR = PROJECT_ROOT / "data" / "smpl"
+SMPL_PKL_NAME = "SMPL_NEUTRAL.pkl"
 
 SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
-# Human-prior 옵션
-USE_ROMP_IF_AVAILABLE = True
 MIN_IMAGES = 3
-# Synthetic fallback: 원형 궤도 반지름(미터 단위 개념), 카메라가 바라보는 원점 = 인체 중심
 SYNTHETIC_ORBIT_RADIUS = 3.0
-SYNTHETIC_FOCAL_SCALE = 1.2  # focal = max(W,H) * this
+SYNTHETIC_FOCAL_SCALE = 1.2
 
 
 def _list_image_paths(dir_path: Path) -> list[Path]:
@@ -58,178 +58,146 @@ def _write_ply(vertices: np.ndarray, faces: np.ndarray, out_path: Path) -> None:
         f.write(f"element face {nf}\n".encode())
         f.write(b"property list uchar int vertex_indices\nend_header\n")
         f.write(vertices.astype(np.float32).tobytes())
-        # PLY face: count (3) + indices
         for row in faces:
             f.write(np.uint8(3).tobytes())
             f.write(row.astype(np.int32).tobytes())
     return
 
 
-def _synthetic_cameras_and_mesh(
+def _to_numpy(x: Any) -> np.ndarray:
+    """Chumpy / array-like → numpy."""
+    if isinstance(x, np.ndarray):
+        return x
+    try:
+        return np.array(x)
+    except Exception:
+        pass
+    if hasattr(x, "r"):
+        return np.array(x.r)
+    return np.array(x)
+
+
+def load_smpl_canonical_tpose(
+    pkl_path: Path,
+    beta: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    SMPL_NEUTRAL.pkl에서 T-pose(pose=0) 메시 생성.
+    V = v_template + shapedirs @ beta (beta 기본 0).
+    반환: (vertices, faces), vertices (6890, 3), faces (13776, 3).
+    """
+    path = Path(pkl_path)
+    if not path.exists():
+        raise FileNotFoundError(f"[Stage2] SMPL model not found: {path}")
+
+    with open(path, "rb") as f:
+        try:
+            model = pickle.load(f, encoding="latin1")
+        except TypeError:
+            model = pickle.load(f)
+
+    v_template = _to_numpy(model["v_template"]).astype(np.float64)
+    shapedirs = _to_numpy(model["shapedirs"]).astype(np.float64)
+    # faces: key can be 'f' or 'faces'
+    faces = _to_numpy(model.get("f", model.get("faces", []))).astype(np.int32)
+
+    if beta is None:
+        beta = np.zeros(10, dtype=np.float64)
+    else:
+        beta = np.asarray(beta, dtype=np.float64).flatten()[:10]
+        if len(beta) < 10:
+            beta = np.pad(beta, (0, 10 - len(beta)))
+
+    # V = v_template + shapedirs @ beta. shapedirs: (6890,3,10) or (6890*3, 10)
+    if shapedirs.ndim == 3:
+        v_shaped = v_template + np.einsum("vcd,d->vc", shapedirs, beta)
+    elif shapedirs.shape[0] == v_template.size:
+        v_shaped = v_template + (shapedirs @ beta).reshape(-1, 3)
+    else:
+        v_shaped = v_template + (shapedirs @ beta).reshape(v_template.shape)
+    vertices = np.ascontiguousarray(v_shaped.astype(np.float32))
+    return vertices, faces
+
+
+def _synthetic_cameras(
     image_paths: list[Path],
     orbit_radius: float,
     focal_scale: float,
-) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
-    """
-    Synthetic: 원형 궤도 카메라 + 단순 placeholder 메시(상자).
-    세계 좌표: 원점 = 인체 중심. 카메라가 원 주위에서 원점을 바라봄.
-    """
+) -> list[dict[str, Any]]:
+    """원형 궤도 카메라만 생성. 세계 좌표: 원점 = 인체 중심."""
     n = len(image_paths)
     cameras = []
     for i, path in enumerate(image_paths):
         w, h = _image_size(path)
         angle = 2 * np.pi * i / max(n, 1)
-        # 카메라 위치 (Y-up 가정, Z가 앞쪽)
         cx = orbit_radius * np.cos(angle)
         cz = orbit_radius * np.sin(angle)
         cam_pos = np.array([cx, 0.0, cz])
-        # 원점을 바라보는 뷰
         forward = -cam_pos / (np.linalg.norm(cam_pos) + 1e-8)
         up = np.array([0.0, 1.0, 0.0])
         right = np.cross(forward, up)
         right = right / (np.linalg.norm(right) + 1e-8)
         up = np.cross(right, forward)
         R = np.eye(3)
-        R[0], R[1], R[2] = right, -up, -forward  # world-to-camera
-        t = -R @ cam_pos
+        R[0], R[1], R[2] = right, -up, -forward
+        t = (-R @ cam_pos).tolist()
         f = max(w, h) * focal_scale
         K = [[f, 0, w / 2], [0, f, h / 2], [0, 0, 1]]
         cameras.append({
             "image": path.name,
             "K": K,
             "R": R.tolist(),
-            "t": t.tolist(),
+            "t": t,
             "width": w,
             "height": h,
         })
-    # Placeholder mesh: 원점 중심 작은 상자 (canonical body 대체)
-    s = 0.5
-    vertices = np.array([
-        [-s, -s, -s], [s, -s, -s], [s, s, -s], [-s, s, -s],
-        [-s, -s, s], [s, -s, s], [s, s, s], [-s, s, s],
-    ], dtype=np.float32)
-    faces = np.array([
-        [0, 1, 2], [0, 2, 3], [1, 5, 6], [1, 6, 2],
-        [5, 4, 7], [5, 7, 6], [4, 0, 3], [4, 3, 7],
-        [3, 2, 6], [3, 6, 7], [4, 5, 1], [4, 1, 0],
-    ], dtype=np.int32)
-    return cameras, vertices, faces
+    return cameras
 
 
-def _run_romp(
-    image_paths: list[Path],
-    output_dir: Path,
-) -> tuple[list[dict[str, Any]] | None, np.ndarray | None, np.ndarray | None]:
-    """
-    ROMP으로 per-image SMPL + 카메라 추정 후,
-    canonical mesh(첫 프레임 또는 평균 shape) 및 cameras 반환.
-    실패 시 None 반환.
-    """
-    try:
-        import cv2
-        import romp
-    except ImportError:
-        return None, None, None
-
-    try:
-        settings = romp.main.default_settings
-        model = romp.ROMP(settings)
-    except Exception:
-        return None, None, None
-
-    all_cameras = []
-    all_verts = []
-    faces_ref = None
-
-    for path in image_paths:
-        img = cv2.imread(str(path))
-        if img is None:
-            continue
-        try:
-            outputs = model(img)
-            if outputs is None:
-                continue
-            # ROMP 출력: 버전에 따라 dict 또는 'results' 리스트
-            res = outputs.get("results", outputs) if isinstance(outputs, dict) else outputs
-            if isinstance(res, (list, tuple)) and len(res) > 0:
-                res = res[0]
-            if not isinstance(res, dict):
-                continue
-            if "verts" in res:
-                v = np.asarray(res["verts"])
-                if v.ndim == 3:
-                    v = v[0]
-                all_verts.append(v)
-            cam = _romp_to_camera(res, path)
-            if cam is not None:
-                all_cameras.append(cam)
-            if "faces" in res and faces_ref is None:
-                faces_ref = np.asarray(res["faces"], dtype=np.int32)
-        except Exception:
-            continue
-
-    if not all_cameras or len(all_cameras) < MIN_IMAGES:
-        return None, None, None
-
-    # Canonical mesh: 첫 프레임 메시 사용 (ROMP은 posed mesh 반환; T-pose는 smplx 등 별도 필요)
-    vertices = None
-    faces = faces_ref
-    if all_verts and faces_ref is not None:
-        vertices = all_verts[0]
-        faces = faces_ref
-    return all_cameras, vertices, faces
-
-
-def _romp_to_camera(romp_result: dict, image_path: Path) -> dict | None:
-    """ROMP 결과에서 K, R, t (world-to-camera) 구성. world = body at origin."""
-    w, h = _image_size(image_path)
-    # Weak-perspective 가정: scale, trans_xy
-    scale = romp_result.get("cam_scale", romp_result.get("scale", 1.0))
-    if isinstance(scale, (list, np.ndarray)):
-        scale = float(scale[0]) if len(scale) else 1.0
-    trans = romp_result.get("cam_trans", romp_result.get("trans", [0, 0]))
-    trans = np.asarray(trans).flatten()
-    tx_2d = trans[0] if len(trans) > 0 else 0.0
-    ty_2d = trans[1] if len(trans) > 1 else 0.0
-    # depth so that body center projects to (tx_2d, ty_2d)
-    depth = max(w, h) * scale
-    cx, cy = w / 2, h / 2
-    fx = fy = max(w, h) * 1.2
-    K = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
-    # 카메라가 원점(몸 중심)을 (tx_2d, ty_2d)에 투영하도록 R, t 설정
-    # 원점이 이미지 (tx_2d, ty_2d)에 오려면: [0,0,depth] -> (cx, cy) + scale*(0,0) -> (tx_2d, ty_2d) => trans = (tx_2d - cx, ty_2d - cy)
-    # weak persp: x_2d = s * (x_cam/z_cam) + tx, y_2d = s * (y_cam/z_cam) + ty. 원점이 몸이면 body_cam = (0,0,depth) 정도.
-    # 단순화: R=I, t=(0,0,-depth) so 원점이 카메라 앞쪽 depth에 있음. 그럼 투영은 (cx, cy). 우리는 (tx_2d, ty_2d)로 옮기고 싶음.
-    t = np.array([-(tx_2d - cx) * depth / fx, -(ty_2d - cy) * depth / fy, -depth], dtype=np.float64)
-    R = np.eye(3).tolist()
-    return {
-        "image": image_path.name,
-        "K": K,
-        "R": R,
-        "t": t.tolist(),
-        "width": w,
-        "height": h,
-    }
+def _resolve_smpl_path(smpl_path: Path | None) -> Path:
+    env = __import__("os").environ.get("SMPL_MODEL_PATH")
+    if env:
+        p = Path(env).resolve()
+        if p.is_file():
+            return p
+        if (p / SMPL_PKL_NAME).is_file():
+            return p / SMPL_PKL_NAME
+    if smpl_path is not None:
+        p = Path(smpl_path).resolve()
+        if p.is_file():
+            return p
+        if (p / SMPL_PKL_NAME).is_file():
+            return p / SMPL_PKL_NAME
+    default = SMPL_MODEL_DIR / SMPL_PKL_NAME
+    if default.is_file():
+        return default
+    raise FileNotFoundError(
+        f"[Stage2] SMPL model not found. Place {SMPL_PKL_NAME} in:\n"
+        f"  - {SMPL_MODEL_DIR}\n"
+        f"  - or set env SMPL_MODEL_PATH to file or directory containing it."
+    )
 
 
 def run(
     image_dir: Path | None = None,
     output_dir: Path | None = None,
-    use_romp: bool | None = None,
+    smpl_path: Path | None = None,
+    beta: np.ndarray | None = None,
 ) -> Path:
     """
-    Stage 2: Human-prior 기반 canonical mesh + 카메라 생성.
-    COLMAP 미사용.
+    Stage 2: Human shape prior 생성.
+    - SMPL_NEUTRAL.pkl → canonical T-pose mesh (canonical_mesh.ply).
+    - Synthetic orbit cameras (cameras.json, image_list.txt).
 
     - image_dir: 입력 이미지 디렉터리 (기본: data/processed_images)
     - output_dir: 출력 디렉터리 (기본: data/human_prior)
-    - use_romp: True면 ROMP 시도, False면 synthetic만. None이면 USE_ROMP_IF_AVAILABLE 사용.
-    - 반환: output_dir (data/human_prior).
+    - smpl_path: SMPL_NEUTRAL.pkl 파일 경로 또는 해당 파일이 있는 디렉터리
+    - beta: SMPL shape 계수 (10,). None이면 0 (평균 body).
     """
     image_dir = image_dir or PROCESSED_IMAGES_DIR
     output_dir = output_dir or HUMAN_PRIOR_DIR
-    image_dir = image_dir.resolve()
-    output_dir = output_dir.resolve()
+    image_dir = Path(image_dir).resolve()
+    output_dir = Path(output_dir).resolve()
 
     if not image_dir.is_dir():
         raise FileNotFoundError(
@@ -243,52 +211,35 @@ def run(
             f"[Stage2] Too few images: {len(image_paths)} (need at least {MIN_IMAGES}).\n"
             f"Image dir: {image_dir}"
         )
-    print(f"[Stage2] Found {len(image_paths)} images (human-prior, no COLMAP).", flush=True)
+    print(f"[Stage2] Found {len(image_paths)} images. Building human shape prior (no COLMAP/ROMP).", flush=True)
 
-    use_romp = use_romp if use_romp is not None else USE_ROMP_IF_AVAILABLE
-    cameras = None
-    vertices = None
-    faces = None
+    pkl_path = _resolve_smpl_path(smpl_path)
+    print(f"[Stage2] Loading SMPL from {pkl_path}", flush=True)
+    vertices, faces = load_smpl_canonical_tpose(pkl_path, beta=beta)
+    print(f"[Stage2] Canonical T-pose mesh: {len(vertices)} vertices, {len(faces)} faces.", flush=True)
 
-    if use_romp:
-        print("[Stage2] Trying ROMP for body + camera estimation...", flush=True)
-        cameras, vertices, faces = _run_romp(image_paths, output_dir)
-
-    if cameras is None:
-        print("[Stage2] Using synthetic cameras (orbit + placeholder mesh).", flush=True)
-        cameras, vertices, faces = _synthetic_cameras_and_mesh(
-            image_paths,
-            orbit_radius=SYNTHETIC_ORBIT_RADIUS,
-            focal_scale=SYNTHETIC_FOCAL_SCALE,
-        )
+    cameras = _synthetic_cameras(
+        image_paths,
+        orbit_radius=SYNTHETIC_ORBIT_RADIUS,
+        focal_scale=SYNTHETIC_FOCAL_SCALE,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # cameras.json
+    mesh_path = output_dir / "canonical_mesh.ply"
+    _write_ply(vertices, faces, mesh_path)
+    print(f"[Stage2] Wrote {mesh_path} (vertices={len(vertices)}, faces={len(faces)}).", flush=True)
+
     cameras_path = output_dir / "cameras.json"
     with open(cameras_path, "w", encoding="utf-8") as f:
         json.dump({"cameras": cameras}, f, indent=2)
     print(f"[Stage2] Wrote {cameras_path} ({len(cameras)} cameras).", flush=True)
 
-    # image_list.txt
     list_path = output_dir / "image_list.txt"
     with open(list_path, "w", encoding="utf-8") as f:
         for c in cameras:
             f.write(c["image"] + "\n")
     print(f"[Stage2] Wrote {list_path}.", flush=True)
-
-    # canonical_mesh.ply
-    if vertices is not None and faces is not None:
-        mesh_path = output_dir / "canonical_mesh.ply"
-        _write_ply(vertices, faces, mesh_path)
-        print(f"[Stage2] Wrote {mesh_path} (vertices={len(vertices)}, faces={len(faces)}).", flush=True)
-    else:
-        # fallback: minimal box
-        _, v, f = _synthetic_cameras_and_mesh(
-            image_paths[:1], SYNTHETIC_ORBIT_RADIUS, SYNTHETIC_FOCAL_SCALE
-        )
-        _write_ply(v, f, output_dir / "canonical_mesh.ply")
-        print("[Stage2] Wrote canonical_mesh.ply (placeholder).", flush=True)
 
     print("[Stage2] Success. Output: data/human_prior/", flush=True)
     return output_dir
@@ -298,7 +249,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Stage 2: Human-prior geometry — canonical mesh + cameras (no COLMAP)"
+        description="Stage 2: Human shape prior — SMPL T-pose mesh + synthetic cameras (no COLMAP/ROMP)"
     )
     parser.add_argument(
         "--images",
@@ -313,9 +264,10 @@ def main() -> None:
         help="Output directory (default: data/human_prior)",
     )
     parser.add_argument(
-        "--no-romp",
-        action="store_true",
-        help="Disable ROMP; use synthetic cameras only",
+        "--smpl",
+        type=Path,
+        default=None,
+        help=f"Path to {SMPL_PKL_NAME} or directory containing it. Default: {SMPL_MODEL_DIR}/",
     )
     args = parser.parse_args()
 
@@ -323,9 +275,9 @@ def main() -> None:
         run(
             image_dir=args.images,
             output_dir=args.out,
-            use_romp=not args.no_romp,
+            smpl_path=args.smpl,
         )
-        print("Stage 2 done. Output: data/human_prior/ (cameras.json, canonical_mesh.ply, image_list.txt)", flush=True)
+        print("Stage 2 done. Output: data/human_prior/ (canonical_mesh.ply, cameras.json, image_list.txt)", flush=True)
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(str(e), file=sys.stderr, flush=True)
         sys.exit(1)

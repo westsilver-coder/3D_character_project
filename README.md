@@ -123,16 +123,16 @@
 
 ---
 
-### Stage 2 — Human-Prior 기반 3D 복원 (COLMAP 미사용)
+### Stage 2 — Human shape prior 생성 (COLMAP/ROMP 미사용)
 
 | 구분 | 내용 |
 |------|------|
-| **목적** | 인체 prior(ROMP/SMPL 또는 synthetic 카메라)로 canonical mesh + per-image 카메라 생성. deformation/stylization 가능한 기하 구조 제공 |
-| **입력** | Stage 1 전처리 이미지 세트 |
-| **처리** | 단일 이미지 인체 추정(ROMP 등) 또는 synthetic 원형 궤도 카메라. Canonical body space 기준 mesh + cameras.json |
-| **출력** | `data/human_prior/` — canonical_mesh.ply, cameras.json, image_list.txt → 3DGS 초기화용 |
+| **목적** | SMPL T-pose 메시 + synthetic orbit 카메라로 human shape prior 생성. Stage 3에서 mesh 표면을 Gaussian 초기화에 사용 |
+| **입력** | Stage 1 전처리 이미지 디렉터리 (이미지 목록·해상도만 사용) |
+| **처리** | `SMPL_NEUTRAL.pkl` 직접 로드 → canonical T-pose mesh. 카메라는 원형 궤도(synthetic) |
+| **출력** | `data/human_prior/` — canonical_mesh.ply (~6890 verts), cameras.json, image_list.txt |
+| **SMPL 모델** | `data/smpl/SMPL_NEUTRAL.pkl` 또는 환경변수 `SMPL_MODEL_PATH` (smpl.is.tue.mpg.de에서 다운로드) |
 | **구현** | `pipeline/stage2_reconstruct.py`, `gs/train_3dgs.py` |
-| **설계** | Geometry 기준·3DGS 연결 방법: `docs/STAGE2_HUMAN_PRIOR.md` 참고 |
 
 ---
 

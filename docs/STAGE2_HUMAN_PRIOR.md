@@ -14,7 +14,7 @@
 |------|-------------------|------------------------------|
 | **세계 좌표계** | SfM이 추정한 임의의 3D 좌표계 | **Canonical body space**: 인체 모델(SMPL)의 T-pose, 원점 = 몸 중심(pelvis 근처) |
 | **기하 기준** | Sparse 3D points + triangulation | **Canonical mesh**: 평균 body shape(β) + T-pose(θ=0) SMPL 메시. 이후 3DGS는 이 메시 표면/근처에서 초기화 가능 |
-| **카메라 정보** | SfM으로 추정된 R, t, K (실패 시 camera=1) | **Per-image 추정**: 단일 이미지 인체 추정(ROMP 등)으로 얻은 weak-perspective 또는 perspective 카메라. “촬영 시점”을 canonical body 기준으로 표현 |
+| **카메라 정보** | SfM으로 추정된 R, t, K (실패 시 camera=1) | **Synthetic orbit**: 원형 궤도 perspective 카메라. canonical body 원점을 바라봄. “촬영 시점”을 canonical body 기준으로 표현 |
 | **일관성** | 여러 뷰의 feature 일치로 결정 | **인체 prior로 뷰 간 일관성**: 모든 이미지가 “같은 사람”의 서로 다른 각도로 정의됨 |
 
 정리하면, **geometry의 기준은 “Canonical human mesh (SMPL T-pose + 평균 shape)”** 이고, **각 이미지의 카메라는 이 canonical space에서의 시점(extrinsic + intrinsic)** 으로 저장된다. 3DGS는 이 카메라와 (선택) canonical 메시 기반 초기점으로 학습한다.
@@ -27,16 +27,14 @@
 - **Stage 1 출력**: `data/processed_images/` (전처리된 전신 인물 이미지)
 
 ### 출력 (기본: `data/human_prior/`)
-- **`canonical_mesh.ply`**: Canonical space 기준 인체 메시 (SMPL T-pose + 평균 β). deformation·스타일 단계의 기하 참조.
-- **`cameras.json`**: 이미지별 카메라 파라미터 (intrinsic K, extrinsic R, t). 3DGS 학습용.
+- **`canonical_mesh.ply`**: SMPL T-pose 메시 (vertices ~6890). `SMPL_NEUTRAL.pkl`에서 직접 생성. Stage 3 Gaussian 초기화용.
+- **`cameras.json`**: Synthetic orbit 카메라 (K, R, t). 3DGS 학습용.
 - **`image_list.txt`**: 사용된 이미지 파일명 목록 (순서 일치).
-- (선택) **`per_image_smpl.npz`**: 이미지별 SMPL 파라미터·메시 (디버깅/분석용).
 
 ### 처리 흐름
-1. 각 이미지에 대해 **인체 추정** (ROMP 등): SMPL pose/shape + 카메라(scale, translation 또는 K, R, t).
-2. **Canonical 집계**: 여러 이미지의 shape(β) 평균 → T-pose(θ=0)로 canonical mesh 생성 → PLY 저장.
-3. **카메라 정리**: 각 이미지의 “촬영 시점”을 canonical body 좌표계로 변환해 `cameras.json`에 저장.
-4. ROMP 미설치 시 **synthetic 모드**: bbox + 원형 궤도 가정으로 카메라만 생성, placeholder 메시로 파이프라인 동작 보장.
+1. **SMPL 로드**: `SMPL_NEUTRAL.pkl` 직접 로드 → canonical T-pose 메시 → PLY 저장.
+2. **Synthetic 카메라**: 입력 이미지 목록·해상도로 원형 궤도 카메라 생성 → cameras.json, image_list.txt.
+3. ROMP/COLMAP 없음. Stage 2 = human shape prior 생성.
 
 ---
 
