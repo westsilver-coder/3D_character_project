@@ -13,15 +13,70 @@ from __future__ import annotations
 import json
 import pickle
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-if 'chumpy' not in sys.modules:
+
+def _inject_dummy_chumpy() -> None:
+    """
+    chumpy를 실제로 import하지 않고, pickle이 chumpy 클래스를 참조할 때
+    사용할 더미 모듈을 sys.modules에 주입. Python 3.12 등에서 chumpy 크래시 방지.
+    """
+    if "chumpy" in sys.modules:
+        return
+
+    class _DummyChumpy:
+        """Pickle이 역직렬화할 때 사용. .r에 numpy 배열을 노출 (chumpy 호환)."""
+
+        def __new__(cls, *args):
+            obj = object.__new__(cls)
+            if args and (hasattr(args[0], "shape") or hasattr(args[0], "r")):
+                obj.r = _extract_array(args[0]) or np.array([])
+            else:
+                obj.r = np.array([])
+            return obj
+
+        def __setstate__(self, state):
+            arr = None
+            if isinstance(state, tuple) and len(state) > 0:
+                arr = _extract_array(state[0])
+            elif isinstance(state, dict):
+                if "r" in state:
+                    arr = _extract_array(state["r"])
+                else:
+                    for v in state.values():
+                        arr = _extract_array(v)
+                        if arr is not None:
+                            break
+            else:
+                arr = _extract_array(state)
+            if arr is not None:
+                self.r = arr
+
+    def _extract_array(x):
+        if isinstance(x, np.ndarray):
+            return np.asarray(x, dtype=np.float64)
+        if hasattr(x, "r"):
+            return np.asarray(x.r, dtype=np.float64)
+        if hasattr(x, "shape"):
+            return np.asarray(x, dtype=np.float64)
+        return None
+
     chumpy = types.ModuleType("chumpy")
+    chumpy.ch = types.ModuleType("chumpy.ch")
+    chumpy.chumpy = types.ModuleType("chumpy.chumpy")
+    chumpy.Ch = _DummyChumpy
+    chumpy.Core = _DummyChumpy
+    chumpy.ch.Ch = _DummyChumpy
+    chumpy.chumpy.Core = _DummyChumpy
+    chumpy.chumpy.Chumpy = _DummyChumpy
     sys.modules["chumpy"] = chumpy
-    sys.modules["chumpy.ch"] = chumpy
+    sys.modules["chumpy.ch"] = chumpy.ch
+    sys.modules["chumpy.chumpy"] = chumpy.chumpy
+
 
 # -----------------------------------------------------------------------------
 # 경로
@@ -87,14 +142,16 @@ def load_smpl_canonical_tpose(
     beta: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    SMPL_NEUTRAL.pkl에서 T-pose(pose=0) 메시 생성.
-    V = v_template + shapedirs @ beta (beta 기본 0).
+    SMPL_NEUTRAL.pkl에서 T-pose(pose=0) 메시만 생성.
+    chumpy 미사용: 더미 chumpy를 sys.modules에 주입 후 pickle 로드.
+    v_template, shapedirs, f만 numpy로 추출. posedirs/촘/chumpy graph 미사용.
     반환: (vertices, faces), vertices (6890, 3), faces (13776, 3).
     """
     path = Path(pkl_path)
     if not path.exists():
         raise FileNotFoundError(f"[Stage2] SMPL model not found: {path}")
 
+    _inject_dummy_chumpy()
     with open(path, "rb") as f:
         try:
             model = pickle.load(f, encoding="latin1")
@@ -103,7 +160,6 @@ def load_smpl_canonical_tpose(
 
     v_template = _to_numpy(model["v_template"]).astype(np.float64)
     shapedirs = _to_numpy(model["shapedirs"]).astype(np.float64)
-    # faces: key can be 'f' or 'faces'
     faces = _to_numpy(model.get("f", model.get("faces", []))).astype(np.int32)
 
     if beta is None:
