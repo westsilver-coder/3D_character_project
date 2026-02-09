@@ -171,8 +171,8 @@ def _render_one_view(
     sh_rest = gaussians.get_sh_rest()
 
     # means2D / cov3D: rasterizer may recompute from means3D; pass zeros if API requires
-    means2D = torch.zeros_like(xyz, device=device)
-    cov3D = torch.zeros((xyz.shape[0], 6), device=device)
+    # means2D = torch.zeros_like(xyz, device=device)
+    #cov3D = torch.zeros((xyz.shape[0], 6), device=device)
     shs = torch.cat([sh_dc, sh_rest], dim=1)
 
     K = np.array(cam["K"])
@@ -198,13 +198,13 @@ def _render_one_view(
     )
     rasterizer = rasterizer_fn(settings)
     out, _, _, _, _, _ = rasterizer(
-        means3D=xyz.unsqueeze(0),
-        means2D=means2D.unsqueeze(0),
-        shs=shs.unsqueeze(0),
+        means3D=xyz,
+        means2D=means2D,
+        shs=shs,
         colors_precomp=None,
-        opacities=opacity.unsqueeze(0),
-        scales=scales.unsqueeze(0),
-        rotations=quats.unsqueeze(0),
+        opacities=opacity,
+        scales=scales,
+        rotations=quats,
         # cov3Ds_precomp=cov3D.unsqueeze(0),
     )
     return out.squeeze(0)
