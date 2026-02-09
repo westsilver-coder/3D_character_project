@@ -125,16 +125,32 @@ def _write_ply(vertices: np.ndarray, faces: np.ndarray, out_path: Path) -> None:
 
 
 def _to_numpy(x: Any) -> np.ndarray:
-    """Chumpy / array-like → numpy."""
+    """
+    다양한 SMPL pkl 타입을 numpy ndarray로 변환.
+    - numpy ndarray → 그대로 반환
+    - hasattr(x, 'r') (chumpy/dummy) → np.asarray(x.r)
+    - scipy sparse (toarray) → np.asarray(x.toarray())
+    - list/tuple → np.asarray(x)
+    실패 시 명확한 TypeError.
+    """
     if isinstance(x, np.ndarray):
         return x
-    try:
-        return np.array(x)
-    except Exception:
-        pass
     if hasattr(x, "r"):
-        return np.array(x.r)
-    return np.array(x)
+        return np.asarray(x.r)
+    if hasattr(x, "toarray"):
+        return np.asarray(x.toarray())
+    if isinstance(x, (list, tuple)):
+        return np.asarray(x)
+    try:
+        out = np.asarray(x)
+        if out.dtype == object or out.ndim == 0:
+            raise TypeError(f"Cannot convert to numpy: type={type(x).__name__}, repr={repr(x)[:80]}")
+        return out
+    except (ValueError, TypeError) as e:
+        raise TypeError(
+            f"[Stage2] Cannot convert to numpy array: type={type(x).__name__}. "
+            f"Expected ndarray, object with .r, scipy sparse with .toarray(), or list/tuple. {e}"
+        ) from e
 
 
 def load_smpl_canonical_tpose(
@@ -159,7 +175,11 @@ def load_smpl_canonical_tpose(
             model = pickle.load(f)
 
     v_template = _to_numpy(model["v_template"]).astype(np.float64)
-    shapedirs = _to_numpy(model["shapedirs"]).astype(np.float64)
+    shapedirs = _to_numpy(model["shapedirs"])
+    # (6890, 3, K) → (-1, K) 로 flatten 후 float64
+    if shapedirs.ndim == 3:
+        shapedirs = shapedirs.reshape(-1, shapedirs.shape[-1])
+    shapedirs = shapedirs.astype(np.float64)
     faces = _to_numpy(model.get("f", model.get("faces", []))).astype(np.int32)
 
     if beta is None:
@@ -169,10 +189,10 @@ def load_smpl_canonical_tpose(
         if len(beta) < 10:
             beta = np.pad(beta, (0, 10 - len(beta)))
 
-    # V = v_template + shapedirs @ beta. shapedirs: (6890,3,10) or (6890*3, 10)
-    if shapedirs.ndim == 3:
-        v_shaped = v_template + np.einsum("vcd,d->vc", shapedirs, beta)
-    elif shapedirs.shape[0] == v_template.size:
+    # V = v_template + shapedirs @ beta. shapedirs: (6890*3, K) or (6890, 3, K) already flattened
+    K = shapedirs.shape[1]
+    beta = beta[:K]
+    if shapedirs.shape[0] == v_template.size:
         v_shaped = v_template + (shapedirs @ beta).reshape(-1, 3)
     else:
         v_shaped = v_template + (shapedirs @ beta).reshape(v_template.shape)
