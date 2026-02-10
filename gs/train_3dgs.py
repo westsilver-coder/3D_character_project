@@ -34,7 +34,7 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 # Initialization (critical for gradient flow and visible color)
 # - Scale too small (e.g. 0.01) → splats invisible → no color gradient
 # - sh_dc = 0 → black → no signal to learn from
-INIT_SCALE = 0.06  # exp(log)=0.06; larger than 0.01 so splats visible from step 0
+INIT_SCALE = 0.12  # debug: 0.1~0.2 so splats clearly visible; 0.06 is minimal
 INIT_OPACITY = 0.9  # high so contributions are non-zero
 # DC color init: from GT mean (scene-specific) or neutral gray if no images
 INIT_DC_FROM_GT_N_IMAGES = 8  # average mean RGB of first N GT images for sh_dc init
@@ -146,6 +146,9 @@ def _initial_dc_color_from_gt(
         gt = _load_gt_image(image_dir, image_list[i]).to(device)
         acc += gt.mean(dim=(1, 2))
     mean_rgb = (acc / n).clamp(0.0, 1.0)
+    # Ensure non-black so color gradient can flow; fallback to gray if mean is too dark
+    if mean_rgb.max() < 0.1:
+        mean_rgb = torch.full_like(mean_rgb, INIT_DC_FALLBACK)
     return mean_rgb.view(1, 1, 3)
 
 
@@ -224,7 +227,8 @@ def _render_one_view(
     xyz = gaussians.get_xyz()
     scales = gaussians.get_scales()
     quats = gaussians.get_rotations()
-    opacity = gaussians.get_opacity()
+    # Rasterizer expects opacities (N, 1) only. Do not expand to (N, 1, 3) or alpha compositing breaks → black screen.
+    opacity = gaussians.get_opacity()  # (N, 1)
     sh_dc = gaussians.get_sh_dc()
     sh_rest = gaussians.get_sh_rest()
 
@@ -271,13 +275,13 @@ def _render_one_view(
     )
     rasterizer = rasterizer_fn(settings)
     out = rasterizer(
-        means3D = xyz,
-        means2D = means2D,
-        shs = None,
-        colors_precomp = colors_precomp,
-        opacities = opacity,
-        scales = scales,
-        rotations = quats,
+        means3D=xyz,
+        means2D=means2D,
+        shs=None,
+        colors_precomp=colors_precomp,
+        opacities=opacity,  # (N, 1) only
+        scales=scales,
+        rotations=quats,
     )
 
     if isinstance(out, tuple):
@@ -324,6 +328,16 @@ def run(
     )
     gaussians._sh_dc.data = dc_init.expand(num_points, 1, 3).clone()
 
+    # Debug: log initial energy so we can confirm non-black
+    with torch.no_grad():
+        op_mean = gaussians.get_opacity().mean().item()
+        scale_mean = gaussians.get_scales().mean().item()
+        dc_mean = gaussians.get_sh_dc().mean().item()
+    print(
+        f"[train_3dgs] Init stats: opacity.mean()={op_mean:.4f}, scale.mean()={scale_mean:.4f}, sh_dc.mean()={dc_mean:.4f}",
+        flush=True,
+    )
+
     optimizer = torch.optim.Adam(
         [
             {"params": [gaussians._xyz], "lr": lr * 0.01},
@@ -340,9 +354,9 @@ def run(
         f"[train_3dgs] Training: {num_points} Gaussians, {n_views} views, device={device}",
         flush=True,
     )
+    dc_rgb = gaussians.get_sh_dc().mean(dim=0).squeeze().tolist()
     print(
-        f"[train_3dgs] Init: scale={INIT_SCALE}, opacity={INIT_OPACITY}, "
-        f"sh_dc mean RGB={gaussians.get_sh_dc().mean(dim=0).squeeze().tolist()}",
+        f"[train_3dgs] Init: scale={INIT_SCALE}, opacity={INIT_OPACITY}, sh_dc mean RGB=[{dc_rgb[0]:.3f}, {dc_rgb[1]:.3f}, {dc_rgb[2]:.3f}]",
         flush=True,
     )
 
@@ -365,7 +379,14 @@ def run(
         loss.backward()
         optimizer.step()
         if (step + 1) % 500 == 0:
-            print(f"[train_3dgs] step {step + 1}/{max_steps} loss={loss.item():.6f}", flush=True)
+            with torch.no_grad():
+                op_m = gaussians.get_opacity().mean().item()
+                sc_m = gaussians.get_scales().mean().item()
+                dc_m = gaussians.get_sh_dc().mean().item()
+            print(
+                f"[train_3dgs] step {step + 1}/{max_steps} loss={loss.item():.6f} | opacity.mean={op_m:.4f} scale.mean={sc_m:.4f} sh_dc.mean={dc_m:.4f}",
+                flush=True,
+            )
         # Debug: save intermediate render to verify Gaussians are visible
         if (step + 1) % DEBUG_SAVE_EVERY == 0:
             debug_dir = checkpoint_dir / "debug_renders"
