@@ -199,7 +199,7 @@ def _render_one_view(
         debug=False,
     )
     rasterizer = rasterizer_fn(settings)
-    out, _, _, _ = rasterizer(
+    out, _, _ = rasterizer(
         xyz,
         means2D,
         shs,
