@@ -175,11 +175,14 @@ def _render_one_view(
     #cov3D = torch.zeros((xyz.shape[0], 6), device=device)
     means2D = torch.zeros((xyz.shape[0], 2), device=device, dtype=xyz.dtype)
 
+    # diff-gaussian-rasterization backward returns grad_colors_precomp as (N, 3).
+    # Passing (N, 1, 3) causes "invalid gradient at index 3". Pass (N, 3) so gradient shape matches.
     if gaussians.sh_degree == 0:
         shs = None
-        colors_precomp = gaussians.get_sh_dc()
+        colors_precomp = gaussians.get_sh_dc().squeeze(1)  # (N, 1, 3) -> (N, 3)
     else:
         shs = torch.cat([sh_dc, sh_rest], dim=1)
+        colors_precomp = None
 
 
     K = np.array(cam["K"])
