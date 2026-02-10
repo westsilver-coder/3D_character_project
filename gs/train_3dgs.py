@@ -116,11 +116,10 @@ def _camera_to_view_proj(cam: dict[str, Any], device: torch.device) -> tuple[tor
     fov_y_rad = 2.0 * np.arctan(h / (2.0 * fy))
     proj = _get_projection_matrix(znear, zfar, fov_x_rad, fov_y_rad)
 
-    # C++ rasterizer: many implementations expect row-major 4x4 (no transpose).
-    # graphdeco Camera uses .transpose(0,1) because getWorld2View2 returns a different layout.
-    # We build view = [R|t] row-major; pass as-is so C++ sees world-to-camera correctly.
-    view_t = torch.from_numpy(view).float().to(device)
-    proj_t = torch.from_numpy(proj).float().to(device)
+    # C++ auxiliary.h: transformPoint4x3 reads matrix column-major (row = matrix[0], matrix[4], matrix[8]).
+    # Our view is row-major, so C++ effectively applies view^T. Pass view.T and proj.T so they apply view and proj.
+    view_t = torch.from_numpy(view).float().to(device).transpose(0, 1)
+    proj_t = torch.from_numpy(proj).float().to(device).transpose(0, 1)
     return view_t, proj_t
 
 
