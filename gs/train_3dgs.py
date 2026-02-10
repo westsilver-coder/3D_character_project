@@ -166,7 +166,7 @@ def _render_one_view(
     xyz = gaussians.get_xyz()
     scales = gaussians.get_scales()
     quats = gaussians.get_rotations()
-    opacity = gaussians.get_opacity()
+    opacity = gaussians.get_opacity().expand(-1, 1, 3)
     sh_dc = gaussians.get_sh_dc()
     sh_rest = gaussians.get_sh_rest()
 
