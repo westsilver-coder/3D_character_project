@@ -164,7 +164,7 @@ def run(
             return run_dummy(output_dir, width, height, cel_bands, color_levels)
         raise
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     num_points = ckpt["xyz"].shape[0]
     RasterSettings, GaussianRasterizer = _get_gaussian_rasterizer()
     gaussians = GaussianModel(num_points, sh_degree=0, device=dev)
