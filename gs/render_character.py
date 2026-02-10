@@ -175,10 +175,15 @@ def run(
     gaussians._sh_dc.data = torch.from_numpy(ckpt["sh_dc"]).float().to(dev)
     gaussians._sh_rest.data = torch.from_numpy(ckpt["sh_rest"]).float().to(dev)
 
+    cameras = []
     try:
         _, cameras, _ = _load_gs_output(gs_output_dir)
-    except Exception:
-        cameras = []
+    except Exception as e:
+        print(
+            f"[render_character] Could not load cameras from {gs_output_dir}: {e}. "
+            "Stage 4 needs cameras.json (from init_3dgs / Stage 2). Pass --gs-output if data is elsewhere.",
+            flush=True,
+        )
 
     saved = []
     if cameras:
@@ -186,9 +191,19 @@ def run(
             try:
                 out = _render_one_view(gaussians, cam, GaussianRasterizer, RasterSettings, dev)
                 rgb = out.permute(1, 2, 0).cpu().numpy()
-            except Exception:
+            except Exception as e:
+                print(f"[render_character] View {i} render failed: {e}", flush=True)
                 continue
             rgb = np.clip(rgb, 0, 1).astype(np.float32)
+            # Save unstyled base render for view 0 so we can tell gray from "no cameras"
+            if i == 0:
+                base_u8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+                base_path = output_dir / "base_view_00.png"
+                try:
+                    from PIL import Image
+                    Image.fromarray(base_u8).save(base_path)
+                except Exception:
+                    np.save(base_path.with_suffix(".npy"), base_u8)
             styled = apply_stylization(rgb, cel_bands, color_levels, saturation, contrast)
             out_u8 = (np.clip(styled, 0, 1) * 255).astype(np.uint8)
             p = output_dir / f"stylized_view_{i:02d}.png"
@@ -198,18 +213,15 @@ def run(
             except Exception:
                 np.save(p.with_suffix(".npy"), out_u8)
             saved.append(p)
+
     if not saved:
-        h, w = height, width
-        rgb = np.ones((h, w, 3), dtype=np.float32) * 0.5
-        styled = apply_stylization(rgb, cel_bands, color_levels, saturation, contrast)
-        out_u8 = (np.clip(styled, 0, 1) * 255).astype(np.uint8)
-        p = output_dir / "stylized_view_00.png"
-        try:
-            from PIL import Image
-            Image.fromarray(out_u8).save(p)
-        except Exception:
-            np.save(p.with_suffix(".npy"), out_u8)
-        saved.append(p)
+        # We have a checkpoint but no successful renders → do not save gray placeholder.
+        raise RuntimeError(
+            "No stylized views were rendered. Either no cameras were loaded "
+            f"(check that {gs_output_dir} contains cameras.json from init_3dgs) or every view render failed. "
+            "Fix: run Stage 4 with --gs-output pointing to the same data/gs_output used for training, "
+            "or run from the project root so data/gs_output/cameras.json is found."
+        )
     return saved
 
 
