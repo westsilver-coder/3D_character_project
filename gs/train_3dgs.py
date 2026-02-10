@@ -111,9 +111,11 @@ def _camera_to_view_proj(cam: dict[str, Any], device: torch.device) -> tuple[tor
     fov_y_rad = 2.0 * np.arctan(h / (2.0 * fy))
     proj = _get_projection_matrix(znear, zfar, fov_x_rad, fov_y_rad)
 
-    # graphdeco passes .transpose(0,1) so C++ gets column-major
-    view_t = torch.from_numpy(view).float().to(device).transpose(0, 1)
-    proj_t = torch.from_numpy(proj).float().to(device).transpose(0, 1)
+    # C++ rasterizer: many implementations expect row-major 4x4 (no transpose).
+    # graphdeco Camera uses .transpose(0,1) because getWorld2View2 returns a different layout.
+    # We build view = [R|t] row-major; pass as-is so C++ sees world-to-camera correctly.
+    view_t = torch.from_numpy(view).float().to(device)
+    proj_t = torch.from_numpy(proj).float().to(device)
     return view_t, proj_t
 
 
@@ -146,9 +148,10 @@ def _initial_dc_color_from_gt(
         gt = _load_gt_image(image_dir, image_list[i]).to(device)
         acc += gt.mean(dim=(1, 2))
     mean_rgb = (acc / n).clamp(0.0, 1.0)
-    # Ensure non-black so color gradient can flow; fallback to gray if mean is too dark
+    # Ensure non-black: clamp to at least 0.2 so rasterizer always gets visible color
     if mean_rgb.max() < 0.1:
         mean_rgb = torch.full_like(mean_rgb, INIT_DC_FALLBACK)
+    mean_rgb = mean_rgb.clamp(min=0.2)
     return mean_rgb.view(1, 1, 3)
 
 
@@ -220,6 +223,7 @@ def _render_one_view(
     rasterizer_fn,
     RasterSettings,
     device: torch.device,
+    log_diagnostics: bool = False,
 ) -> torch.Tensor:
     """Render one view; returns (3, H, W) RGB in [0,1]."""
     viewmatrix, projmatrix = _camera_to_view_proj(cam, device)
@@ -246,6 +250,23 @@ def _render_one_view(
         shs = torch.cat([sh_dc, sh_rest], dim=1)
         colors_precomp = None
 
+    if log_diagnostics:
+        # Camera-space z: p_cam = view @ p_world (viewmatrix is 4x4 world-to-camera)
+        xyz_1 = torch.nn.functional.pad(xyz, (0, 1), value=1.0)  # (N, 4)
+        xyz_cam = (viewmatrix @ xyz_1.T).T[:, :3]
+        z_cam = xyz_cam[:, 2]
+        n_total = xyz.shape[0]
+        n_z_neg = (z_cam < 0).sum().item()
+        n_z_pos = (z_cam > 0).sum().item()
+        print(
+            f"[render diag] xyz_cam z: min={z_cam.min().item():.4f} max={z_cam.max().item():.4f} "
+            f"| z<0 (front in OpenGL): {n_z_neg}/{n_total} | z>0: {n_z_pos}/{n_total}"
+        )
+        print(
+            f"[render diag] opacity: min={opacity.min().item():.4f} max={opacity.max().item():.4f} | "
+            f"colors_precomp: min={colors_precomp.min().item():.4f} max={colors_precomp.max().item():.4f} | "
+            f"scales: min={scales.min().item():.6f} max={scales.max().item():.4f}"
+        )
 
     # tanfov: graphdeco convention. tan(fov/2) = pixels/(2*focal) → tanfovx = w/(2*fx), tanfovy = h/(2*fy)
     K = np.array(cam["K"])
@@ -286,7 +307,12 @@ def _render_one_view(
 
     if isinstance(out, tuple):
         out = out[0]
-    return out.squeeze(0)
+    out_img = out.squeeze(0)
+    if log_diagnostics:
+        print(
+            f"[render diag] out RGB: min={out_img.min().item():.4f} max={out_img.max().item():.4f} mean={out_img.mean().item():.4f} shape={tuple(out_img.shape)}"
+        )
+    return out_img
 
 
 def run(
@@ -365,8 +391,11 @@ def run(
         idx = step % n_views
         cam = cameras[idx]
         gt = _load_gt_image(image_dir, image_list[idx]).to(device)
+        do_debug = (step + 1) % DEBUG_SAVE_EVERY == 0
         try:
-            out = _render_one_view(gaussians, cam, GaussianRasterizer, RasterSettings, device)
+            out = _render_one_view(
+                gaussians, cam, GaussianRasterizer, RasterSettings, device, log_diagnostics=do_debug
+            )
         except Exception as e:
             print(f"[train_3dgs] Render failed at step {step}: {e}", flush=True)
             raise
