@@ -173,6 +173,8 @@ def _render_one_view(
     # means2D / cov3D: rasterizer may recompute from means3D; pass zeros if API requires
     # means2D = torch.zeros_like(xyz, device=device)
     #cov3D = torch.zeros((xyz.shape[0], 6), device=device)
+    means2D = torch.zeros((xyz.shape[0], 2), device=device, dtype=xyz.dtype)
+
     shs = torch.cat([sh_dc, sh_rest], dim=1)
 
     K = np.array(cam["K"])
@@ -205,7 +207,7 @@ def _render_one_view(
         opacities=opacity,
         scales=scales,
         rotations=quats,
-        # cov3Ds_precomp=cov3D.unsqueeze(0),
+        cov3Ds_precomp=None,
     )
     return out.squeeze(0)
 
