@@ -205,7 +205,8 @@ class GaussianModel(nn.Module):
         return self._xyz
 
     def get_scales(self) -> torch.Tensor:
-        return torch.exp(self._log_scale).clamp(min=1e-6)
+        # Cap max scale so a few Gaussians don't explode into blobs (keeps shape readable).
+        return torch.exp(self._log_scale).clamp(min=1e-6, max=0.15)
 
     def get_rotations(self) -> torch.Tensor:
         q = self._quat / (self._quat.norm(dim=1, keepdim=True) + 1e-8)
