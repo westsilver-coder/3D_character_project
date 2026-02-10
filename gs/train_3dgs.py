@@ -175,7 +175,11 @@ def _render_one_view(
     #cov3D = torch.zeros((xyz.shape[0], 6), device=device)
     means2D = torch.zeros((xyz.shape[0], 2), device=device, dtype=xyz.dtype)
 
-    shs = torch.cat([sh_dc, sh_rest], dim=1)
+    if gaussians.sh_degree == 0:
+        shs = sh_dc
+    else:
+        shs = torch.cat([sh_dc, sh_rest], dim=1)
+
 
     K = np.array(cam["K"])
     tanfovx = (1.0 / w) * 2 * K[0, 0]
