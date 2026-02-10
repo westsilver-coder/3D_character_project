@@ -190,7 +190,7 @@ def run(
         for i, cam in enumerate(cameras[:num_views]):
             try:
                 out = _render_one_view(gaussians, cam, GaussianRasterizer, RasterSettings, dev)
-                rgb = out.permute(1, 2, 0).cpu().numpy()
+                rgb = out.permute(1, 2, 0).detach().cpu().numpy()
             except Exception as e:
                 print(f"[render_character] View {i} render failed: {e}", flush=True)
                 continue
