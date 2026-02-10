@@ -40,6 +40,9 @@ INIT_OPACITY = 0.9  # high so contributions are non-zero
 INIT_DC_FROM_GT_N_IMAGES = 8  # average mean RGB of first N GT images for sh_dc init
 INIT_DC_FALLBACK = 0.5  # neutral gray when not using GT
 
+# Debug: save intermediate renders during training to verify Gaussians are visible
+DEBUG_SAVE_EVERY = 500  # save render every N steps to checkpoint_dir/debug_renders/
+
 
 def _load_gs_output(data_dir: Path) -> tuple[np.ndarray, list[dict[str, Any]], list[str]]:
     """Load point_cloud.npy, cameras.json, image_list.txt from gs_output."""
@@ -62,30 +65,55 @@ def _load_gs_output(data_dir: Path) -> tuple[np.ndarray, list[dict[str, Any]], l
     return points, cameras, image_list
 
 
+def _get_projection_matrix(znear: float, zfar: float, fov_x_rad: float, fov_y_rad: float) -> np.ndarray:
+    """
+    graphdeco-inria style OpenGL projection matrix (see gaussian-splatting utils/graphics_utils.py).
+    Transforms camera view space to NDC. Use with fovX = 2*atan(w/(2*fx)), fovY = 2*atan(h/(2*fy)).
+    """
+    tan_half_fov_y = np.tan(fov_y_rad / 2.0)
+    tan_half_fov_x = np.tan(fov_x_rad / 2.0)
+    top = tan_half_fov_y * znear
+    bottom = -top
+    right = tan_half_fov_x * znear
+    left = -right
+    P = np.zeros((4, 4), dtype=np.float32)
+    z_sign = 1.0
+    P[0, 0] = 2.0 * znear / (right - left)
+    P[1, 1] = 2.0 * znear / (top - bottom)
+    P[0, 2] = (right + left) / (right - left)
+    P[1, 2] = (top + bottom) / (top - bottom)
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
+
+
 def _camera_to_view_proj(cam: dict[str, Any], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    """K, R, t (world-to-camera) → viewmatrix (4x4), projmatrix (4x4) for rasterizer."""
+    """
+    K, R, t (world-to-camera) → viewmatrix (4x4), projmatrix (4x4) for diff-gaussian-rasterization.
+    Matches graphdeco-inria convention: view = [R|t; 0 0 0 1], then .transpose(0,1) for C++ column-major.
+    R,t from stage2: p_cam = R @ p_world + t.
+    """
     K = np.array(cam["K"], dtype=np.float32)
     R = np.array(cam["R"], dtype=np.float32)
     t = np.array(cam["t"], dtype=np.float32)
     w, h = int(cam["width"]), int(cam["height"])
-    # view: world to camera (4x4)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    znear, zfar = 0.01, 100.0
+
+    # view: world-to-camera 4x4, [R|t; 0 0 0 1]
     view = np.eye(4, dtype=np.float32)
     view[:3, :3] = R
     view[:3, 3] = t
-    # proj: perspective from K
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-    znear, zfar = 0.01, 100.0
-    proj = np.zeros((4, 4), dtype=np.float32)
-    proj[0, 0] = 2 * fx / w
-    proj[1, 1] = 2 * fy / h
-    proj[0, 2] = 2 * (cx / w) - 1
-    proj[1, 2] = 2 * (cy / h) - 1
-    proj[2, 2] = -(zfar + znear) / (zfar - znear)
-    proj[2, 3] = -(2 * zfar * znear) / (zfar - znear)
-    proj[3, 2] = -1
-    view_t = torch.from_numpy(view).to(device)
-    proj_t = torch.from_numpy(proj).to(device)
+
+    # FOV from intrinsics (graphdeco focal2fov: fov = 2*atan(pixels/(2*focal)))
+    fov_x_rad = 2.0 * np.arctan(w / (2.0 * fx))
+    fov_y_rad = 2.0 * np.arctan(h / (2.0 * fy))
+    proj = _get_projection_matrix(znear, zfar, fov_x_rad, fov_y_rad)
+
+    # graphdeco passes .transpose(0,1) so C++ gets column-major
+    view_t = torch.from_numpy(view).float().to(device).transpose(0, 1)
+    proj_t = torch.from_numpy(proj).float().to(device).transpose(0, 1)
     return view_t, proj_t
 
 
@@ -215,10 +243,15 @@ def _render_one_view(
         colors_precomp = None
 
 
+    # tanfov: graphdeco convention. tan(fov/2) = pixels/(2*focal) → tanfovx = w/(2*fx), tanfovy = h/(2*fy)
     K = np.array(cam["K"])
-    tanfovx = (1.0 / w) * 2 * K[0, 0]
-    tanfovy = (1.0 / h) * 2 * K[1, 1]
-    campos = (-viewmatrix[:3, :3].T @ viewmatrix[:3, 3]).unsqueeze(0)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    tanfovx = w / (2.0 * fx)
+    tanfovy = h / (2.0 * fy)
+    # Camera center in world: p_cam = R @ p_world + t ⇒ origin in cam = R @ c + t = 0 ⇒ c = -R.T @ t
+    R = np.array(cam["R"], dtype=np.float32)
+    t = np.array(cam["t"], dtype=np.float32)
+    campos = torch.from_numpy((-R.T @ t).astype(np.float32)).to(device).unsqueeze(0)
     bg = torch.tensor([0, 0, 0], dtype=torch.float32, device=device)
     # API follows graphdeco-inria/diff-gaussian-rasterization; adapt if using another fork
     settings = RasterSettings(
@@ -333,6 +366,16 @@ def run(
         optimizer.step()
         if (step + 1) % 500 == 0:
             print(f"[train_3dgs] step {step + 1}/{max_steps} loss={loss.item():.6f}", flush=True)
+        # Debug: save intermediate render to verify Gaussians are visible
+        if (step + 1) % DEBUG_SAVE_EVERY == 0:
+            debug_dir = checkpoint_dir / "debug_renders"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            out_u8 = (out.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            try:
+                from PIL import Image
+                Image.fromarray(out_u8).save(debug_dir / f"step_{step + 1:06d}.png")
+            except Exception as e:
+                print(f"[train_3dgs] Debug save failed: {e}", flush=True)
         if (step + 1) % save_every == 0 or step == max_steps - 1:
             ckpt = {
                 "step": step + 1,
