@@ -166,7 +166,7 @@ def _render_one_view(
     xyz = gaussians.get_xyz()
     scales = gaussians.get_scales()
     quats = gaussians.get_rotations()
-    opacity = gaussians.get_opacity().unsqueeze(-1).expand(-1, 1, 3)
+    opacity = gaussians.get_opacity()
     sh_dc = gaussians.get_sh_dc()
     sh_rest = gaussians.get_sh_rest()
 
@@ -176,7 +176,8 @@ def _render_one_view(
     means2D = torch.zeros((xyz.shape[0], 2), device=device, dtype=xyz.dtype)
 
     if gaussians.sh_degree == 0:
-        shs = sh_dc
+        shs = None
+        colors_precomp = gaussians.get_sh_dc()
     else:
         shs = torch.cat([sh_dc, sh_rest], dim=1)
 
@@ -203,15 +204,18 @@ def _render_one_view(
         debug=False,
     )
     rasterizer = rasterizer_fn(settings)
-    out, _, _ = rasterizer(
-        xyz,
-        means2D,
-        shs,
-        None,
-        opacity,
-        scales,
-        quats,
+    out = rasterizer(
+        means3D = xyz,
+        means2D = means2D,
+        shs = None,
+        colors_precomp = colors_precomp,
+        opacities = opacity,
+        scales = scales,
+        rotations = quats,
     )
+
+    if isinstance(out, tuple):
+        out = out[0]
     return out.squeeze(0)
 
 
