@@ -200,14 +200,13 @@ def _render_one_view(
     )
     rasterizer = rasterizer_fn(settings)
     out, _, _, _, _, _ = rasterizer(
-        means3D=xyz,
-        means2D=means2D,
-        shs=shs,
-        colors_precomp=None,
-        opacities=opacity,
-        scales=scales,
-        rotations=quats,
-        cov3Ds_precomp=None,
+        xyz,
+        means2D,
+        shs,
+        None,
+        opacity,
+        scales,
+        quats,
     )
     return out.squeeze(0)
 
