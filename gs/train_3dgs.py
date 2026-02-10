@@ -31,6 +31,15 @@ LR = 0.0025
 SH_DEGREE = 0  # DC only
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 
+# Initialization (critical for gradient flow and visible color)
+# - Scale too small (e.g. 0.01) → splats invisible → no color gradient
+# - sh_dc = 0 → black → no signal to learn from
+INIT_SCALE = 0.06  # exp(log)=0.06; larger than 0.01 so splats visible from step 0
+INIT_OPACITY = 0.9  # high so contributions are non-zero
+# DC color init: from GT mean (scene-specific) or neutral gray if no images
+INIT_DC_FROM_GT_N_IMAGES = 8  # average mean RGB of first N GT images for sh_dc init
+INIT_DC_FALLBACK = 0.5  # neutral gray when not using GT
+
 
 def _load_gs_output(data_dir: Path) -> tuple[np.ndarray, list[dict[str, Any]], list[str]]:
     """Load point_cloud.npy, cameras.json, image_list.txt from gs_output."""
@@ -89,6 +98,27 @@ def _load_gt_image(image_dir: Path, name: str) -> torch.Tensor:
             img = np.array(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
             return torch.from_numpy(img).permute(2, 0, 1)
     raise FileNotFoundError(f"[train_3dgs] GT image not found: {name} in {image_dir}")
+
+
+def _initial_dc_color_from_gt(
+    image_dir: Path,
+    image_list: list[str],
+    device: torch.device,
+    n_images: int = 8,
+) -> torch.Tensor:
+    """
+    Average mean RGB of first N GT images → (1, 1, 3) for sh_dc init.
+    Gives scene-specific initial color so DC is not black and gradients can flow.
+    """
+    n = min(n_images, len(image_list))
+    if n == 0:
+        return torch.full((1, 1, 3), INIT_DC_FALLBACK, device=device, dtype=torch.float32)
+    acc = torch.zeros(3, device=device, dtype=torch.float32)
+    for i in range(n):
+        gt = _load_gt_image(image_dir, image_list[i]).to(device)
+        acc += gt.mean(dim=(1, 2))
+    mean_rgb = (acc / n).clamp(0.0, 1.0)
+    return mean_rgb.view(1, 1, 3)
 
 
 def _get_gaussian_rasterizer():
@@ -250,9 +280,16 @@ def run(
     num_points = len(points)
     gaussians = GaussianModel(num_points, sh_degree=SH_DEGREE, device=device)
     gaussians.set_xyz(torch.from_numpy(points).float().to(device))
-    # Small initial scale
-    gaussians._log_scale.data = torch.log(torch.full_like(gaussians._log_scale, 0.01))
-    gaussians._logit_opacity.data = torch.logit(torch.full((num_points, 1), 0.9, device=device))
+
+    # Scale: larger init so splats are visible and color gradients can flow (official often use NN-distances; we use fixed)
+    gaussians._log_scale.data.fill_(float(np.log(INIT_SCALE)))
+    gaussians._logit_opacity.data = torch.logit(torch.full((num_points, 1), INIT_OPACITY, device=device))
+
+    # DC color: init from GT mean (not black). Critical for color learning.
+    dc_init = _initial_dc_color_from_gt(
+        image_dir, image_list, device, n_images=INIT_DC_FROM_GT_N_IMAGES
+    )
+    gaussians._sh_dc.data = dc_init.expand(num_points, 1, 3).clone()
 
     optimizer = torch.optim.Adam(
         [
@@ -260,13 +297,21 @@ def run(
             {"params": [gaussians._log_scale], "lr": lr},
             {"params": [gaussians._quat], "lr": lr * 0.001},
             {"params": [gaussians._logit_opacity], "lr": lr * 0.05},
-            {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.001},
+            {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.01},
         ]
     )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     n_views = len(cameras)
-    print(f"[train_3dgs] Training: {num_points} Gaussians, {n_views} views, device={device}", flush=True)
+    print(
+        f"[train_3dgs] Training: {num_points} Gaussians, {n_views} views, device={device}",
+        flush=True,
+    )
+    print(
+        f"[train_3dgs] Init: scale={INIT_SCALE}, opacity={INIT_OPACITY}, "
+        f"sh_dc mean RGB={gaussians.get_sh_dc().mean(dim=0).squeeze().tolist()}",
+        flush=True,
+    )
 
     for step in range(max_steps):
         optimizer.zero_grad()
