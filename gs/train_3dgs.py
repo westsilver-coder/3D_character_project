@@ -106,6 +106,11 @@ def _camera_to_view_proj(cam: dict[str, Any], device: torch.device) -> tuple[tor
     view[:3, :3] = R
     view[:3, 3] = t
 
+    # diff-gaussian-rasterization C++ uses +Z as forward (t.x/t.z, t.y/t.z; in_frustum culls z<=0).
+    # Stage2 cameras use OpenGL-style -Z forward (our z_cam is negative for points in front).
+    # Flip view Z row so that "in front" in our convention becomes positive z for the rasterizer.
+    view[2, :] = -view[2, :]
+
     # FOV from intrinsics (graphdeco focal2fov: fov = 2*atan(pixels/(2*focal)))
     fov_x_rad = 2.0 * np.arctan(w / (2.0 * fx))
     fov_y_rad = 2.0 * np.arctan(h / (2.0 * fy))
