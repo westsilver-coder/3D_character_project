@@ -4,8 +4,9 @@ Stage 2c: 3D Gaussian Splatting 학습.
 init_3dgs.py 출력을 입력으로 받아 실제 3DGS 학습 수행.
 - 입력: data/gs_output/point_cloud.npy, cameras.json, data/processed_images/ (GT)
 - 기능: Gaussian 파라미터 학습, diff-gaussian-splatting 스타일 training loop
-- COLMAP 미사용. world space = canonical human body space.
-- 출력: 학습된 3DGS checkpoint (data/gs_output/ 또는 지정 경로)
+- COLMAP 미사용. world space = canonical body space.
+- 카메라 R,t도 학습(Option A). 초기값은 cameras.json.
+- 출력: 학습된 3DGS checkpoint (+ 학습된 cameras)
 """
 
 from __future__ import annotations
@@ -44,6 +45,10 @@ INIT_DC_FROM_VIEW = True  # if True, init each Gaussian from first-view projecti
 
 # Debug: save intermediate renders during training to verify Gaussians are visible
 DEBUG_SAVE_EVERY = 500  # save render every N steps to checkpoint_dir/debug_renders/
+
+# Learnable cameras (Option A): lr for camera params (smaller than Gaussian lr)
+LR_CAMERA = 0.0002  # 2e-4
+CAMERA_LEARN = True  # if True, optimize R,t; if False, use fixed cameras as before
 
 
 def _load_gs_output(data_dir: Path) -> tuple[np.ndarray, list[dict[str, Any]], list[str]]:
@@ -123,6 +128,82 @@ def _camera_to_view_proj(cam: dict[str, Any], device: torch.device) -> tuple[tor
     view_t = torch.from_numpy(view).float().to(device).transpose(0, 1)
     proj_t = torch.from_numpy(proj).float().to(device).transpose(0, 1)
     return view_t, proj_t
+
+
+def _rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    """6D continuous rotation (Zhou et al.) → 3x3 R. d6: (6,) or (..., 6). Out: (3,3) or (..., 3, 3)."""
+    need_squeeze = d6.dim() == 1
+    if need_squeeze:
+        d6 = d6.unsqueeze(0)
+    a, b = d6[..., :3], d6[..., 3:6]
+    e1 = a / (a.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+    b_orth = b - (e1 * b).sum(dim=-1, keepdim=True) * e1
+    e2 = b_orth / (b_orth.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+    e3 = torch.linalg.cross(e1, e2, dim=-1)
+    R = torch.stack([e1, e2, e3], dim=-2)
+    if need_squeeze:
+        R = R.squeeze(0)
+    return R
+
+
+def _matrix_to_6d(R: np.ndarray) -> np.ndarray:
+    """3x3 R → first two columns as 6D (for init)."""
+    R = np.asarray(R, dtype=np.float32)
+    return R[:, :2].flatten()
+
+
+class LearnableCameras(nn.Module):
+    """Per-view learnable R (6D) and t. K, w, h from fixed cam dict."""
+    def __init__(self, cameras: list[dict[str, Any]], device: torch.device):
+        super().__init__()
+        self.cameras = cameras
+        self.device = device
+        n = len(cameras)
+        d6_list = []
+        t_list = []
+        for c in cameras:
+            R = np.array(c["R"], dtype=np.float32)
+            t = np.array(c["t"], dtype=np.float32)
+            d6_list.append(_matrix_to_6d(R))
+            t_list.append(t)
+        self._cam_6d = nn.Parameter(torch.from_numpy(np.stack(d6_list)).float().to(device))
+        self._cam_t = nn.Parameter(torch.from_numpy(np.stack(t_list)).float().to(device))
+
+    def get_view_proj_and_campos(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """view (4x4), proj (4x4), campos (1,3) for rasterizer. view/proj column-major for C++."""
+        cam = self.cameras[idx]
+        d6 = self._cam_6d[idx]
+        t = self._cam_t[idx]
+        R = _rotation_6d_to_matrix(d6)
+        view = torch.eye(4, device=self.device, dtype=torch.float32)
+        view[:3, :3] = R
+        view[:3, 3] = t
+        view[2, :] = -view[2, :]
+        view_t = view.T.unsqueeze(0)
+        campos = (-R.T @ t).unsqueeze(0)
+        K = np.array(cam["K"], dtype=np.float32)
+        w, h = int(cam["width"]), int(cam["height"])
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        znear, zfar = 0.01, 100.0
+        fov_x_rad = 2.0 * np.arctan(w / (2.0 * fx))
+        fov_y_rad = 2.0 * np.arctan(h / (2.0 * fy))
+        tan_half_fov_y = np.tan(fov_y_rad / 2.0)
+        tan_half_fov_x = np.tan(fov_x_rad / 2.0)
+        top = tan_half_fov_y * znear
+        bottom = -top
+        right = tan_half_fov_x * znear
+        left = -right
+        P = torch.zeros(4, 4, device=self.device, dtype=torch.float32)
+        z_sign = 1.0
+        P[0, 0] = 2.0 * znear / (right - left)
+        P[1, 1] = 2.0 * znear / (top - bottom)
+        P[0, 2] = (right + left) / (right - left)
+        P[1, 2] = (top + bottom) / (top - bottom)
+        P[3, 2] = z_sign
+        P[2, 2] = z_sign * zfar / (zfar - znear)
+        P[2, 3] = -(zfar * znear) / (zfar - znear)
+        proj_t = P.T.unsqueeze(0)
+        return view_t, proj_t, campos
 
 
 def _load_gt_image(image_dir: Path, name: str) -> torch.Tensor:
@@ -271,9 +352,18 @@ def _render_one_view(
     RasterSettings,
     device: torch.device,
     log_diagnostics: bool = False,
+    view_proj_campos: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Render one view; returns (3, H, W) RGB in [0,1]."""
-    viewmatrix, projmatrix = _camera_to_view_proj(cam, device)
+    """Render one view; returns (3, H, W) RGB in [0,1]. view_proj_campos = (view_t, proj_t, campos) when using learnable cameras."""
+    if view_proj_campos is not None:
+        view_t, proj_t, campos = view_proj_campos
+        viewmatrix = view_t.squeeze(0) if view_t.dim() == 3 else view_t
+        projmatrix = proj_t.squeeze(0) if proj_t.dim() == 3 else proj_t
+    else:
+        viewmatrix, projmatrix = _camera_to_view_proj(cam, device)
+        R = np.array(cam["R"], dtype=np.float32)
+        t = np.array(cam["t"], dtype=np.float32)
+        campos = torch.from_numpy((-R.T @ t).astype(np.float32)).to(device).unsqueeze(0)
     w, h = int(cam["width"]), int(cam["height"])
     xyz = gaussians.get_xyz()
     scales = gaussians.get_scales()
@@ -315,15 +405,11 @@ def _render_one_view(
             f"scales: min={scales.min().item():.6f} max={scales.max().item():.4f}"
         )
 
-    # tanfov: graphdeco convention. tan(fov/2) = pixels/(2*focal) → tanfovx = w/(2*fx), tanfovy = h/(2*fy)
+    # tanfov from fixed K
     K = np.array(cam["K"])
     fx, fy = float(K[0, 0]), float(K[1, 1])
     tanfovx = w / (2.0 * fx)
     tanfovy = h / (2.0 * fy)
-    # Camera center in world: p_cam = R @ p_world + t ⇒ origin in cam = R @ c + t = 0 ⇒ c = -R.T @ t
-    R = np.array(cam["R"], dtype=np.float32)
-    t = np.array(cam["t"], dtype=np.float32)
-    campos = torch.from_numpy((-R.T @ t).astype(np.float32)).to(device).unsqueeze(0)
     bg = torch.tensor([0, 0, 0], dtype=torch.float32, device=device)
     # API follows graphdeco-inria/diff-gaussian-rasterization; adapt if using another fork
     settings = RasterSettings(
@@ -370,6 +456,7 @@ def run(
     save_every: int = SAVE_EVERY,
     lr: float = LR,
     device: str | None = None,
+    camera_learn: bool = CAMERA_LEARN,
 ) -> Path:
     """
     init_3dgs 출력으로 3DGS 학습. COLMAP 미사용. world = canonical body space.
@@ -436,16 +523,20 @@ def run(
         flush=True,
     )
 
-    # Color (SH) needs higher lr so it can move when cameras are imperfect; default was 0.01 → too small
-    optimizer = torch.optim.Adam(
-        [
-            {"params": [gaussians._xyz], "lr": lr * 0.01},
-            {"params": [gaussians._log_scale], "lr": lr},
-            {"params": [gaussians._quat], "lr": lr * 0.001},
-            {"params": [gaussians._logit_opacity], "lr": lr * 0.05},
-            {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.2},
-        ]
-    )
+    # Optimizer: Gaussians + optional learnable cameras
+    param_groups = [
+        {"params": [gaussians._xyz], "lr": lr * 0.01},
+        {"params": [gaussians._log_scale], "lr": lr},
+        {"params": [gaussians._quat], "lr": lr * 0.001},
+        {"params": [gaussians._logit_opacity], "lr": lr * 0.05},
+        {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.2},
+    ]
+    learnable_cameras: LearnableCameras | None = None
+    if camera_learn:
+        learnable_cameras = LearnableCameras(cameras, device)
+        param_groups.append({"params": [learnable_cameras._cam_6d, learnable_cameras._cam_t], "lr": LR_CAMERA})
+        print("[train_3dgs] Learnable cameras enabled (Option A). Optimizing R,t.", flush=True)
+    optimizer = torch.optim.Adam(param_groups)
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     n_views = len(cameras)
@@ -465,9 +556,13 @@ def run(
         cam = cameras[idx]
         gt = _load_gt_image(image_dir, image_list[idx]).to(device)
         do_debug = (step + 1) % DEBUG_SAVE_EVERY == 0
+        view_proj_campos = None
+        if learnable_cameras is not None:
+            view_proj_campos = learnable_cameras.get_view_proj_and_campos(idx)
         try:
             out = _render_one_view(
-                gaussians, cam, GaussianRasterizer, RasterSettings, device, log_diagnostics=do_debug
+                gaussians, cam, GaussianRasterizer, RasterSettings, device, log_diagnostics=do_debug,
+                view_proj_campos=view_proj_campos,
             )
         except Exception as e:
             print(f"[train_3dgs] Render failed at step {step}: {e}", flush=True)
@@ -509,6 +604,20 @@ def run(
                 "sh_dc": gaussians.get_sh_dc().detach().cpu().numpy(),
                 "sh_rest": gaussians.get_sh_rest().detach().cpu().numpy(),
             }
+            if learnable_cameras is not None:
+                learned_cams = []
+                for i in range(n_views):
+                    with torch.no_grad():
+                        d6 = learnable_cameras._cam_6d[i]
+                        t = learnable_cameras._cam_t[i].cpu().numpy()
+                        R = _rotation_6d_to_matrix(d6).cpu().numpy()
+                    c = dict(cameras[i])
+                    c["R"] = R.tolist()
+                    c["t"] = t.tolist()
+                    learned_cams.append(c)
+                ckpt["cameras"] = learned_cams
+                ckpt["cam_6d"] = learnable_cameras._cam_6d.detach().cpu().numpy()
+                ckpt["cam_t"] = learnable_cameras._cam_t.detach().cpu().numpy()
             path = checkpoint_dir / f"ckpt_step_{step + 1}.pth"
             torch.save(ckpt, path)
             print(f"[train_3dgs] Saved {path}", flush=True)
@@ -527,6 +636,7 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=SAVE_EVERY)
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--no-camera-learn", action="store_true", help="Disable learnable cameras (use fixed cameras only)")
     args = parser.parse_args()
     try:
         run(
@@ -537,6 +647,7 @@ def main() -> None:
             save_every=args.save_every,
             lr=args.lr,
             device=args.device,
+            camera_learn=not args.no_camera_learn,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(str(e), file=sys.stderr)
