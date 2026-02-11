@@ -33,19 +33,24 @@ from typing import Any
 import numpy as np
 
 # Depth: body at origin, camera at distance. tz = -depth (negative).
+# Fixed depth for stabilization (world scale = mesh height 1.0); bbox-based depth disabled.
+FIXED_DEPTH = 5.0
 DEFAULT_DEPTH = 2.5
 DEPTH_MIN = 1.0
 DEPTH_MAX = 6.0
-# Focal: 1.2~1.5 * max(w,h) per requirement. K compatible with 3DGS.
-DEFAULT_FOCAL_SCALE = 1.2
-FOCAL_SCALE_MIN = 1.2
-FOCAL_SCALE_MAX = 1.5
+# Focal: max(w,h) * focal_scale. Clamp to avoid geometry collapse.
+DEFAULT_FOCAL_SCALE = 1.0
+FOCAL_SCALE_MIN = 0.8
+FOCAL_SCALE_MAX = 1.2
 
 # Failure detection thresholds
 VAR_CENTER_WARN = 0.01 ** 2   # variance of camera centers (per axis) below this → warn
 R_IDENTITY_TOL = 0.15         # max Frobenius |R - I| to consider "all identity"
 TZ_SAME_TOL = 0.05            # max std of tz to consider "all tz same"
 FOREGROUND_RATIO_MIN = 0.02   # bbox heuristic: foreground pixels ratio below → warn
+# Pre-training: camera must be outside mesh (world scale = mesh height 1.0)
+MIN_CAMERA_DIST_WARN = 1.0    # warn if distance from origin < this
+MIN_CAMERA_DIST_FAIL = 0.5    # fail if distance < this (camera inside mesh)
 
 
 def _rotation_axis_angle_to_matrix(axis_angle: np.ndarray) -> np.ndarray:
@@ -153,24 +158,27 @@ def estimate_camera_from_image(
     image_path: Path,
     *,
     use_romp: bool = True,
-    fallback_depth: float = DEFAULT_DEPTH,
+    fallback_depth: float = FIXED_DEPTH,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Estimate world-to-camera (R, t) for one image.
     Convention: p_cam = R @ p_world + t; body at origin → t[2] < 0 (tz negative).
+    Depth fixed to FIXED_DEPTH (tz = -FIXED_DEPTH) for world-scale stability; bbox-based depth not used.
     """
     image_path = Path(image_path)
     if not image_path.exists():
         raise FileNotFoundError(f"[camera_estimation] Image not found: {image_path}")
 
-    cx_norm, cy_norm, bbox_depth, foreground_ratio = _bbox_depth_and_center(image_path)
+    cx_norm, cy_norm, _, _ = _bbox_depth_and_center(image_path)
     try:
         from PIL import Image
         with Image.open(image_path) as im:
             w, h = im.size
     except Exception:
         w, h = 1024, 1024
-    f = max(w, h) * DEFAULT_FOCAL_SCALE
+    focal_scale = np.clip(DEFAULT_FOCAL_SCALE, FOCAL_SCALE_MIN, FOCAL_SCALE_MAX)
+    f = max(w, h) * float(focal_scale)
+    tz = -float(FIXED_DEPTH)
 
     R_romp, t_romp = None, None
     if use_romp:
@@ -180,17 +188,11 @@ def estimate_camera_from_image(
 
     if R_romp is not None and t_romp is not None:
         R = R_romp
-        # ROMP translation may be weak-perspective; force tz from bbox for stability.
-        tz = -float(bbox_depth)
-        tx = (cx_norm * w - w / 2) * tz / f
-        ty = (cy_norm * h - h / 2) * tz / f
-        t = np.array([tx, ty, tz], dtype=np.float32)
     else:
         R = np.eye(3, dtype=np.float32)
-        tz = -float(bbox_depth)
-        tx = (cx_norm * w - w / 2) * tz / f
-        ty = (cy_norm * h - h / 2) * tz / f
-        t = np.array([tx, ty, tz], dtype=np.float32)
+    tx = (cx_norm * w - w / 2) * tz / f
+    ty = (cy_norm * h - h / 2) * tz / f
+    t = np.array([tx, ty, tz], dtype=np.float32)
     return R, t
 
 
@@ -328,8 +330,8 @@ def run_pre_training_checks(
     mesh_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> bool:
     """
-    Pre-training sanity: (1) centers surround the subject, (2) cameras look at scene,
-    (3) no camera inside object. Returns True if checks pass (no hard failure).
+    Pre-training sanity: (1) centers surround the subject, (2) cameras look at origin,
+    (3) no camera inside mesh. Returns False on hard failure (camera inside mesh).
     """
     if not cameras:
         return True
@@ -339,16 +341,32 @@ def run_pre_training_checks(
     # (1) Spread around: variance of centers should be positive
     if centers.var(axis=0).sum() < VAR_CENTER_WARN:
         print("[camera_estimation] Pre-train check: camera distribution very tight.", flush=True)
-    # (2) All look toward origin: camera forward = -R.T third column; dot with (origin - c) should be > 0
+    # (2) Camera direction: forward · to_origin > 0 (camera looks toward origin)
     for i, c in enumerate(cameras):
         R = np.array(c["R"], dtype=np.float64)
-        t = np.array(c["t"], dtype=np.float64)
-        cam_pos = camera_center_from_Rt(R, t)
+        cam_pos = camera_center_from_Rt(R, np.array(c["t"]))
         forward = -R.T[:, 2]
         to_origin = origin - cam_pos
-        if np.dot(forward, to_origin) < -0.1:
-            print(f"[camera_estimation] Pre-train check: camera {i} may not face origin.", flush=True)
-    # (3) No camera inside: distance from origin should be > small epsilon
-    if np.any(dists < 0.1):
-        print("[camera_estimation] Pre-train check: at least one camera very close to origin (inside object?).", flush=True)
+        dot_val = np.dot(forward, to_origin)
+        if dot_val <= 0:
+            print(
+                f"[camera_estimation] Pre-train check: camera {i} does not face origin "
+                f"(forward·to_origin={dot_val:.4f}, should be > 0).",
+                flush=True,
+            )
+    # (3) Distance: warn if < MIN_CAMERA_DIST_WARN; fail if < MIN_CAMERA_DIST_FAIL (inside mesh)
+    for i, d in enumerate(dists):
+        if d < MIN_CAMERA_DIST_WARN:
+            print(
+                f"[camera_estimation] Pre-train check: camera {i} too close to origin "
+                f"(dist={d:.3f} < {MIN_CAMERA_DIST_WARN}). 3DGS may collapse.",
+                flush=True,
+            )
+    if np.any(dists < MIN_CAMERA_DIST_FAIL):
+        print(
+            f"[camera_estimation] Pre-train check FAIL: at least one camera inside mesh "
+            f"(dist < {MIN_CAMERA_DIST_FAIL}). Refusing to continue.",
+            flush=True,
+        )
+        return False
     return True

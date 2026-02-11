@@ -94,6 +94,8 @@ SUPPORTED_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 MIN_IMAGES = 3
 SYNTHETIC_ORBIT_RADIUS = 3.0
 SYNTHETIC_FOCAL_SCALE = 1.2
+# Focal scale clamped to avoid geometry collapse; must match camera_estimation.py
+FOCAL_SCALE_CLAMP = (0.8, 1.2)
 
 
 def _list_image_paths(dir_path: Path) -> list[Path]:
@@ -205,6 +207,19 @@ def load_smpl_canonical_tpose(
     return vertices, faces
 
 
+def _normalize_mesh_height(vertices: np.ndarray) -> np.ndarray:
+    """
+    Normalize mesh so world-space height = 1.0. Unifies world scale for cameras/focal.
+    height = max_y - min_y; vertices /= height.
+    """
+    min_y = float(vertices[:, 1].min())
+    max_y = float(vertices[:, 1].max())
+    height = max_y - min_y
+    if height < 1e-6:
+        return vertices
+    return np.ascontiguousarray((vertices / height).astype(np.float32))
+
+
 def _synthetic_cameras(
     image_paths: list[Path],
     orbit_radius: float,
@@ -307,7 +322,11 @@ def _build_cameras_estimated(
             foreground_ratios=foreground_ratios,
         )
     if pre_train_checks and cameras:
-        run_pre_training_checks(cameras, mesh_origin=(0.0, 0.0, 0.0))
+        if not run_pre_training_checks(cameras, mesh_origin=(0.0, 0.0, 0.0)):
+            raise ValueError(
+                "[Stage2] Pre-training checks failed (e.g. camera inside mesh). "
+                "Fix cameras or use --camera-mode synthetic."
+            )
     return cameras
 
 
@@ -316,7 +335,7 @@ def run(
     output_dir: Path | None = None,
     smpl_path: Path | None = None,
     beta: np.ndarray | None = None,
-    camera_mode: str = "estimated",
+    camera_mode: str = "synthetic",
     focal_scale: float = SYNTHETIC_FOCAL_SCALE,
     log_poses: bool = True,
     sanity_check: bool = True,
@@ -353,7 +372,10 @@ def run(
     print(f"[Stage2] Loading SMPL from {pkl_path}", flush=True)
     vertices, faces = load_smpl_canonical_tpose(pkl_path, beta=beta)
     print(f"[Stage2] Canonical T-pose mesh: {len(vertices)} vertices, {len(faces)} faces.", flush=True)
+    vertices = _normalize_mesh_height(vertices)
+    print("[Stage2] Mesh normalized to height=1.0 (world scale).", flush=True)
 
+    focal_scale = float(np.clip(focal_scale, FOCAL_SCALE_CLAMP[0], FOCAL_SCALE_CLAMP[1]))
     if camera_mode == "synthetic":
         cameras = _synthetic_cameras(
             image_paths,
@@ -434,8 +456,8 @@ def main() -> None:
     parser.add_argument(
         "--camera-mode",
         choices=("synthetic", "estimated"),
-        default="estimated",
-        help="synthetic: orbit cameras (debug). estimated: per-image R,t from pose (default)",
+        default="synthetic",
+        help="synthetic: orbit cameras (default, stable). estimated: per-image R,t (requires ROMP)",
     )
     parser.add_argument(
         "--focal-scale",
