@@ -46,9 +46,17 @@ INIT_DC_FROM_VIEW = True  # if True, init each Gaussian from first-view projecti
 # Debug: save intermediate renders during training to verify Gaussians are visible
 DEBUG_SAVE_EVERY = 500  # save render every N steps to checkpoint_dir/debug_renders/
 
-# Learnable cameras (Option A): lr for camera params (smaller than Gaussian lr)
-LR_CAMERA = 0.0002  # 2e-4
-CAMERA_LEARN = True  # if True, optimize R,t; if False, use fixed cameras as before
+# Learnable cameras (Option A): stability
+CAMERA_LEARN = True
+LR_CAMERA_RATIO = 0.08  # camera_lr = lr * LR_CAMERA_RATIO (e.g. 0.0025*0.08=2e-4). Kept smaller than Gaussian so pose refines gently.
+CAMERA_FREEZE_STEPS = 1500  # first N steps: camera grads zeroed (Gaussian only). Then unfreeze for joint opt.
+# Regularization (soft penalties; balance so learning is not blocked)
+MIN_CAM_DIST = 1.0  # camera center must stay this far from origin (world scale ~ mesh height 1.0)
+REG_DIST_WEIGHT = 0.1  # penalty when dist < MIN_CAM_DIST
+REG_TZ_POS_WEIGHT = 1.0  # penalty for t_z > 0 (camera behind scene)
+REG_L2_WEIGHT = 1e-5  # L2 toward initial pose (avoid drift)
+# Logging
+CAMERA_LOG_EVERY = 500  # log camera stats every N steps
 
 
 def _load_gs_output(data_dir: Path) -> tuple[np.ndarray, list[dict[str, Any]], list[str]]:
@@ -131,7 +139,10 @@ def _camera_to_view_proj(cam: dict[str, Any], device: torch.device) -> tuple[tor
 
 
 def _rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
-    """6D continuous rotation (Zhou et al.) → 3x3 R. d6: (6,) or (..., 6). Out: (3,3) or (..., 3, 3)."""
+    """
+    6D continuous rotation (Zhou et al.) → 3x3 R via Gram–Schmidt. Differentiable, no singularities.
+    d6: (6,) or (..., 6). Out: (3,3) or (..., 3, 3). L2 reg + ortho logging keep it stable; quaternion is an alternative if needed.
+    """
     need_squeeze = d6.dim() == 1
     if need_squeeze:
         d6 = d6.unsqueeze(0)
@@ -153,7 +164,7 @@ def _matrix_to_6d(R: np.ndarray) -> np.ndarray:
 
 
 class LearnableCameras(nn.Module):
-    """Per-view learnable R (6D) and t. K, w, h from fixed cam dict."""
+    """Per-view learnable R (6D) and t. K, w, h from fixed cam dict. Holds initial values for L2 reg."""
     def __init__(self, cameras: list[dict[str, Any]], device: torch.device):
         super().__init__()
         self.cameras = cameras
@@ -166,8 +177,12 @@ class LearnableCameras(nn.Module):
             t = np.array(c["t"], dtype=np.float32)
             d6_list.append(_matrix_to_6d(R))
             t_list.append(t)
-        self._cam_6d = nn.Parameter(torch.from_numpy(np.stack(d6_list)).float().to(device))
-        self._cam_t = nn.Parameter(torch.from_numpy(np.stack(t_list)).float().to(device))
+        d6_np = np.stack(d6_list)
+        t_np = np.stack(t_list)
+        self._cam_6d = nn.Parameter(torch.from_numpy(d6_np).float().to(device))
+        self._cam_t = nn.Parameter(torch.from_numpy(t_np).float().to(device))
+        self.register_buffer("_cam_6d_init", torch.from_numpy(d6_np).float().to(device))
+        self.register_buffer("_cam_t_init", torch.from_numpy(t_np).float().to(device))
 
     def get_view_proj_and_campos(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """view (4x4), proj (4x4), campos (1,3) for rasterizer. view/proj column-major for C++."""
@@ -204,6 +219,48 @@ class LearnableCameras(nn.Module):
         P[2, 3] = -(zfar * znear) / (zfar - znear)
         proj_t = P.T.unsqueeze(0)
         return view_t, proj_t, campos
+
+    def get_centers_depths_ortho(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """For logging: centers (n,3), depths (n,) = -t_z, ortho_err (n,) = ||R^T R - I||_F per view."""
+        n = self._cam_6d.shape[0]
+        centers = []
+        depths = []
+        ortho_errs = []
+        for i in range(n):
+            d6 = self._cam_6d[i]
+            t = self._cam_t[i]
+            R = _rotation_6d_to_matrix(d6)
+            c = -R.T @ t
+            centers.append(c)
+            depths.append(-t[2].item())
+            ortho = (R.T @ R - torch.eye(3, device=self.device)).norm("fro").item()
+            ortho_errs.append(ortho)
+        return torch.stack(centers), torch.tensor(depths, device=self.device), torch.tensor(ortho_errs, device=self.device)
+
+    def regularization_loss(
+        self,
+        min_dist: float,
+        reg_dist_weight: float,
+        reg_tz_pos_weight: float,
+        reg_l2_weight: float,
+    ) -> torch.Tensor:
+        """Soft penalties: camera too close to origin, t_z > 0, L2 away from init."""
+        loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        n = self._cam_6d.shape[0]
+        for i in range(n):
+            d6 = self._cam_6d[i]
+            t = self._cam_t[i]
+            R = _rotation_6d_to_matrix(d6)
+            c = -R.T @ t
+            dist = c.norm()
+            if dist < min_dist:
+                loss = loss + reg_dist_weight * (min_dist - dist) ** 2
+            if t[2] > 0:
+                loss = loss + reg_tz_pos_weight * (t[2] ** 2)
+        loss = loss + reg_l2_weight * (
+            (self._cam_6d - self._cam_6d_init).pow(2).sum() + (self._cam_t - self._cam_t_init).pow(2).sum()
+        )
+        return loss
 
 
 def _load_gt_image(image_dir: Path, name: str) -> torch.Tensor:
@@ -457,6 +514,8 @@ def run(
     lr: float = LR,
     device: str | None = None,
     camera_learn: bool = CAMERA_LEARN,
+    camera_freeze_steps: int = CAMERA_FREEZE_STEPS,
+    lr_camera_ratio: float = LR_CAMERA_RATIO,
 ) -> Path:
     """
     init_3dgs 출력으로 3DGS 학습. COLMAP 미사용. world = canonical body space.
@@ -532,10 +591,15 @@ def run(
         {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.2},
     ]
     learnable_cameras: LearnableCameras | None = None
+    lr_camera = lr * lr_camera_ratio
     if camera_learn:
         learnable_cameras = LearnableCameras(cameras, device)
-        param_groups.append({"params": [learnable_cameras._cam_6d, learnable_cameras._cam_t], "lr": LR_CAMERA})
-        print("[train_3dgs] Learnable cameras enabled (Option A). Optimizing R,t.", flush=True)
+        param_groups.append({"params": [learnable_cameras._cam_6d, learnable_cameras._cam_t], "lr": lr_camera})
+        print(
+            f"[train_3dgs] Learnable cameras (Option A). lr_camera={lr_camera:.2e} (ratio={lr_camera_ratio}), "
+            f"freeze first {camera_freeze_steps} steps.",
+            flush=True,
+        )
     optimizer = torch.optim.Adam(param_groups)
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -573,7 +637,17 @@ def run(
                 out.unsqueeze(0), size=(gt.shape[1], gt.shape[2]), mode="bilinear", align_corners=False
             ).squeeze(0)
         loss = (out - gt).abs().mean()
+        if learnable_cameras is not None and step >= camera_freeze_steps:
+            reg = learnable_cameras.regularization_loss(
+                MIN_CAM_DIST, REG_DIST_WEIGHT, REG_TZ_POS_WEIGHT, REG_L2_WEIGHT
+            )
+            loss = loss + reg
         loss.backward()
+        if learnable_cameras is not None and step < camera_freeze_steps:
+            if learnable_cameras._cam_6d.grad is not None:
+                learnable_cameras._cam_6d.grad.zero_()
+            if learnable_cameras._cam_t.grad is not None:
+                learnable_cameras._cam_t.grad.zero_()
         optimizer.step()
         if (step + 1) % 500 == 0:
             with torch.no_grad():
@@ -582,6 +656,21 @@ def run(
                 dc_m = gaussians.get_sh_dc().mean().item()
             print(
                 f"[train_3dgs] step {step + 1}/{max_steps} loss={loss.item():.6f} | opacity.mean={op_m:.4f} scale.mean={sc_m:.4f} sh_dc.mean={dc_m:.4f}",
+                flush=True,
+            )
+        if learnable_cameras is not None and (step + 1) % CAMERA_LOG_EVERY == 0:
+            with torch.no_grad():
+                centers, depths, ortho = learnable_cameras.get_centers_depths_ortho()
+                c_min = centers.min(dim=0).values.cpu().numpy()
+                c_max = centers.max(dim=0).values.cpu().numpy()
+                c_var = centers.var(dim=0).cpu().numpy()
+                mean_depth = depths.mean().item()
+                mean_ortho = ortho.mean().item()
+                cam_frozen = " (cam frozen)" if step < camera_freeze_steps else ""
+            print(
+                f"[camera] step {step + 1} centers min=({c_min[0]:.3f},{c_min[1]:.3f},{c_min[2]:.3f}) "
+                f"max=({c_max[0]:.3f},{c_max[1]:.3f},{c_max[2]:.3f}) var=({c_var[0]:.4f},{c_var[1]:.4f},{c_var[2]:.4f}) "
+                f"mean_depth={mean_depth:.3f} ortho_err={mean_ortho:.6f}{cam_frozen}",
                 flush=True,
             )
         # Debug: save intermediate render to verify Gaussians are visible
@@ -637,6 +726,8 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=LR)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--no-camera-learn", action="store_true", help="Disable learnable cameras (use fixed cameras only)")
+    parser.add_argument("--camera-freeze-steps", type=int, default=CAMERA_FREEZE_STEPS, help=f"Steps to freeze camera params (default {CAMERA_FREEZE_STEPS})")
+    parser.add_argument("--lr-camera-ratio", type=float, default=LR_CAMERA_RATIO, help=f"Camera lr = lr * this (default {LR_CAMERA_RATIO})")
     args = parser.parse_args()
     try:
         run(
@@ -648,6 +739,8 @@ def main() -> None:
             lr=args.lr,
             device=args.device,
             camera_learn=not args.no_camera_learn,
+            camera_freeze_steps=args.camera_freeze_steps,
+            lr_camera_ratio=args.lr_camera_ratio,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(str(e), file=sys.stderr)
