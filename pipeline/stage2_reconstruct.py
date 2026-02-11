@@ -1,11 +1,11 @@
 """
-Stage 2: Human shape prior 생성 (COLMAP / ROMP 미사용).
+Stage 2: Human shape prior 생성.
 
 - 입력: Stage 1 출력 data/processed_images/ (이미지 목록·해상도만 사용)
-- 처리: SMPL_NEUTRAL.pkl 직접 로드 → canonical T-pose mesh. 카메라는 synthetic orbit.
-- 출력: data/human_prior/ (canonical_mesh.ply ~6890 verts, cameras.json, image_list.txt)
-
-Stage 3(gs/train_3dgs.py)에서 이 mesh 표면을 Gaussian 초기화에 사용.
+- 처리: SMPL_NEUTRAL.pkl → canonical T-pose mesh. 카메라는 --camera_mode에 따라:
+  - synthetic: 기존 원형 궤도 (디버깅용)
+  - estimated: 이미지별 추정 R,t (pipeline/camera_estimation.py)
+- 출력: data/human_prior/ (canonical_mesh.ply, cameras.json, image_list.txt)
 """
 
 from __future__ import annotations
@@ -257,21 +257,71 @@ def _resolve_smpl_path(smpl_path: Path | None) -> Path:
     )
 
 
+def _build_cameras_estimated(
+    image_paths: list[Path],
+    focal_scale: float,
+    log_poses: bool = True,
+    sanity_check: bool = True,
+    use_romp: bool = True,
+    pre_train_checks: bool = True,
+) -> list[dict[str, Any]]:
+    """Per-image camera estimation. Each camera i corresponds to image_paths[i]."""
+    from pipeline.camera_estimation import (
+        estimate_camera_from_image,
+        build_camera_entry,
+        run_sanity_check,
+        run_pre_training_checks,
+        camera_center_from_Rt,
+        get_bbox_foreground_ratio,
+        FOCAL_SCALE_MIN,
+        FOCAL_SCALE_MAX,
+    )
+    focal_scale = max(FOCAL_SCALE_MIN, min(FOCAL_SCALE_MAX, float(focal_scale)))
+    cameras = []
+    tz_list = []
+    foreground_ratios = []
+    for i, path in enumerate(image_paths):
+        R, t = estimate_camera_from_image(path, use_romp=use_romp)
+        cam = build_camera_entry(path, R, t, focal_scale=focal_scale)
+        cameras.append(cam)
+        tz_list.append(float(t[2]))
+        foreground_ratios.append(get_bbox_foreground_ratio(path))
+        if log_poses:
+            c_world = camera_center_from_Rt(R, t)
+            print(
+                f"[Stage2] estimated [{i}] {path.name}: "
+                f"t=({t[0]:.3f},{t[1]:.3f},{t[2]:.3f}) cam_center=({c_world[0]:.3f},{c_world[1]:.3f},{c_world[2]:.3f})",
+                flush=True,
+            )
+    if sanity_check and cameras:
+        run_sanity_check(
+            cameras,
+            tz_values=tz_list,
+            foreground_ratios=foreground_ratios,
+        )
+    if pre_train_checks and cameras:
+        run_pre_training_checks(cameras, mesh_origin=(0.0, 0.0, 0.0))
+    return cameras
+
+
 def run(
     image_dir: Path | None = None,
     output_dir: Path | None = None,
     smpl_path: Path | None = None,
     beta: np.ndarray | None = None,
+    camera_mode: str = "estimated",
+    focal_scale: float = SYNTHETIC_FOCAL_SCALE,
+    log_poses: bool = True,
+    sanity_check: bool = True,
+    viz_cameras: bool = False,
 ) -> Path:
     """
     Stage 2: Human shape prior 생성.
     - SMPL_NEUTRAL.pkl → canonical T-pose mesh (canonical_mesh.ply).
-    - Synthetic orbit cameras (cameras.json, image_list.txt).
+    - cameras.json: camera_mode "synthetic" (orbit) or "estimated" (per-image R,t).
 
-    - image_dir: 입력 이미지 디렉터리 (기본: data/processed_images)
-    - output_dir: 출력 디렉터리 (기본: data/human_prior)
-    - smpl_path: SMPL_NEUTRAL.pkl 파일 경로 또는 해당 파일이 있는 디렉터리
-    - beta: SMPL shape 계수 (10,). None이면 0 (평균 body).
+    - camera_mode: "synthetic" | "estimated"
+    - viz_cameras: if True, write camera_centers.json for debugging.
     """
     image_dir = image_dir or PROCESSED_IMAGES_DIR
     output_dir = output_dir or HUMAN_PRIOR_DIR
@@ -290,18 +340,31 @@ def run(
             f"[Stage2] Too few images: {len(image_paths)} (need at least {MIN_IMAGES}).\n"
             f"Image dir: {image_dir}"
         )
-    print(f"[Stage2] Found {len(image_paths)} images. Building human shape prior (no COLMAP/ROMP).", flush=True)
+    print(f"[Stage2] Found {len(image_paths)} images. camera_mode={camera_mode}.", flush=True)
 
     pkl_path = _resolve_smpl_path(smpl_path)
     print(f"[Stage2] Loading SMPL from {pkl_path}", flush=True)
     vertices, faces = load_smpl_canonical_tpose(pkl_path, beta=beta)
     print(f"[Stage2] Canonical T-pose mesh: {len(vertices)} vertices, {len(faces)} faces.", flush=True)
 
-    cameras = _synthetic_cameras(
-        image_paths,
-        orbit_radius=SYNTHETIC_ORBIT_RADIUS,
-        focal_scale=SYNTHETIC_FOCAL_SCALE,
-    )
+    if camera_mode == "synthetic":
+        cameras = _synthetic_cameras(
+            image_paths,
+            orbit_radius=SYNTHETIC_ORBIT_RADIUS,
+            focal_scale=focal_scale,
+        )
+    elif camera_mode == "estimated":
+        cameras = _build_cameras_estimated(
+            image_paths,
+            focal_scale=focal_scale,
+            log_poses=log_poses,
+            sanity_check=sanity_check,
+            use_romp=True,
+        )
+    else:
+        raise ValueError(
+            f"[Stage2] camera_mode must be 'synthetic' or 'estimated', got: {camera_mode}"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -313,6 +376,19 @@ def run(
     with open(cameras_path, "w", encoding="utf-8") as f:
         json.dump({"cameras": cameras}, f, indent=2)
     print(f"[Stage2] Wrote {cameras_path} ({len(cameras)} cameras).", flush=True)
+
+    if viz_cameras and cameras:
+        from pipeline.camera_estimation import camera_center_from_Rt
+        centers = []
+        for c in cameras:
+            R = np.array(c["R"], dtype=np.float64)
+            t = np.array(c["t"], dtype=np.float64)
+            cc = camera_center_from_Rt(R, t)
+            centers.append({"image": c["image"], "center": [float(cc[0]), float(cc[1]), float(cc[2])]})
+        viz_path = output_dir / "camera_centers.json"
+        with open(viz_path, "w", encoding="utf-8") as f:
+            json.dump({"camera_centers": centers}, f, indent=2)
+        print(f"[Stage2] Wrote {viz_path} (camera centers for debugging).", flush=True)
 
     list_path = output_dir / "image_list.txt"
     with open(list_path, "w", encoding="utf-8") as f:
@@ -328,7 +404,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Stage 2: Human shape prior — SMPL T-pose mesh + synthetic cameras (no COLMAP/ROMP)"
+        description="Stage 2: Human shape prior — SMPL T-pose mesh + cameras (synthetic orbit or per-image estimated)"
     )
     parser.add_argument(
         "--images",
@@ -348,6 +424,33 @@ def main() -> None:
         default=None,
         help=f"Path to {SMPL_PKL_NAME} or directory containing it. Default: {SMPL_MODEL_DIR}/",
     )
+    parser.add_argument(
+        "--camera-mode",
+        choices=("synthetic", "estimated"),
+        default="estimated",
+        help="synthetic: orbit cameras (debug). estimated: per-image R,t from pose (default)",
+    )
+    parser.add_argument(
+        "--focal-scale",
+        type=float,
+        default=SYNTHETIC_FOCAL_SCALE,
+        help="Focal length scale (default %.2f)" % SYNTHETIC_FOCAL_SCALE,
+    )
+    parser.add_argument(
+        "--no-log-poses",
+        action="store_true",
+        help="Do not log per-image R,t when camera_mode=estimated",
+    )
+    parser.add_argument(
+        "--no-sanity-check",
+        action="store_true",
+        help="Skip camera center sanity check when camera_mode=estimated",
+    )
+    parser.add_argument(
+        "--viz-cameras",
+        action="store_true",
+        help="Write camera_centers.json for debugging",
+    )
     args = parser.parse_args()
 
     try:
@@ -355,6 +458,11 @@ def main() -> None:
             image_dir=args.images,
             output_dir=args.out,
             smpl_path=args.smpl,
+            camera_mode=args.camera_mode,
+            focal_scale=args.focal_scale,
+            log_poses=not args.no_log_poses,
+            sanity_check=not args.no_sanity_check,
+            viz_cameras=args.viz_cameras,
         )
         print("Stage 2 done. Output: data/human_prior/ (canonical_mesh.ply, cameras.json, image_list.txt)", flush=True)
     except (FileNotFoundError, ValueError, RuntimeError) as e:
