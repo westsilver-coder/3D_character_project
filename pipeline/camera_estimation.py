@@ -298,7 +298,8 @@ def run_sanity_check(
     if all(f < R_IDENTITY_TOL for f in frob_diffs):
         print(
             "[camera_estimation] WARNING: All rotations near identity. "
-            "ROMP may have failed or returned no pose; using fallback for all.",
+            "ROMP may have failed or returned no pose; using fallback (R=identity, t from bbox) for all. "
+            "If camera centers vary enough, 3DGS can still train. Install ROMP/simple_romp for pose-aware cameras.",
             flush=True,
         )
 

@@ -14,6 +14,7 @@ import json
 import pickle
 import sys
 import types
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -169,10 +170,16 @@ def load_smpl_canonical_tpose(
 
     _inject_dummy_chumpy()
     with open(path, "rb") as f:
-        try:
-            model = pickle.load(f, encoding="latin1")
-        except TypeError:
-            model = pickle.load(f)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*scipy\.sparse\.csc.*",
+                category=DeprecationWarning,
+            )
+            try:
+                model = pickle.load(f, encoding="latin1")
+            except TypeError:
+                model = pickle.load(f)
 
     v_template = _to_numpy(model["v_template"]).astype(np.float64)
     shapedirs = _to_numpy(model["shapedirs"])

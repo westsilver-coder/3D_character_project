@@ -39,6 +39,8 @@ INIT_OPACITY = 0.9  # high so contributions are non-zero
 # DC color init: from GT mean (scene-specific) or neutral gray if no images
 INIT_DC_FROM_GT_N_IMAGES = 8  # average mean RGB of first N GT images for sh_dc init
 INIT_DC_FALLBACK = 0.5  # neutral gray when not using GT
+# Per-point color init: sample first view GT at projected points (breaks gray symmetry)
+INIT_DC_FROM_VIEW = True  # if True, init each Gaussian from first-view projection when valid
 
 # Debug: save intermediate renders during training to verify Gaussians are visible
 DEBUG_SAVE_EVERY = 500  # save render every N steps to checkpoint_dir/debug_renders/
@@ -157,6 +159,46 @@ def _initial_dc_color_from_gt(
         mean_rgb = torch.full_like(mean_rgb, INIT_DC_FALLBACK)
     mean_rgb = mean_rgb.clamp(min=0.2)
     return mean_rgb.view(1, 1, 3)
+
+
+def _sample_gt_colors_at_points(
+    cam: dict[str, Any],
+    gt_image: torch.Tensor,
+    xyz_world: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Project world points into the first view and sample GT RGB. Returns (N, 3).
+    Points behind camera or outside image get NaN; caller should replace with fallback.
+    Convention: p_cam = R @ p + t, in front when z_cam < 0; project with fx,fy,cx,cy.
+    """
+    R = torch.from_numpy(np.array(cam["R"], dtype=np.float32)).to(device)
+    t = torch.from_numpy(np.array(cam["t"], dtype=np.float32)).to(device)
+    K = np.array(cam["K"], dtype=np.float32)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    w, h = int(cam["width"]), int(cam["height"])
+    # p_cam = R @ p + t  (3,), (N,3) -> (N,3)
+    p_cam = (xyz_world @ R.T) + t.unsqueeze(0)
+    z = p_cam[:, 2]
+    # in front: z < 0 in our convention; avoid div by zero for points behind
+    denom = torch.where(z < -0.01, (-z).clamp(min=1e-6), torch.ones_like(z, device=device))
+    valid = (z < -0.01) & (denom < 1e4)
+    u = fx * (p_cam[:, 0] / denom) + cx
+    v = fy * (p_cam[:, 1] / denom) + cy
+    # pixel coordinates: round and clamp
+    u_idx = (u.round().long().clamp(0, w - 1))
+    v_idx = (v.round().long().clamp(0, h - 1))
+    in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h) & valid
+    # sample: gt_image is (3, H, W)
+    C, H, W = gt_image.shape
+    colors = torch.full((xyz_world.shape[0], 3), float("nan"), device=device, dtype=gt_image.dtype)
+    if in_bounds.any():
+        v_idx_safe = v_idx.clamp(0, H - 1)
+        u_idx_safe = u_idx.clamp(0, W - 1)
+        sampled = gt_image[:, v_idx_safe, u_idx_safe].T  # (N, 3)
+        colors = torch.where(in_bounds.unsqueeze(1), sampled, colors)
+    return colors
 
 
 def _get_gaussian_rasterizer():
@@ -343,6 +385,17 @@ def run(
     points, cameras, image_list = _load_gs_output(gs_output_dir)
     if not image_list or not cameras:
         raise ValueError("[train_3dgs] No cameras or image list in gs_output.")
+    # Warn if all rotations are identity (e.g. ROMP failed in Stage 2) → color can stay gray
+    R_list = [np.array(c["R"], dtype=np.float64) for c in cameras]
+    I = np.eye(3, dtype=np.float64)
+    all_identity = all(np.linalg.norm(R - I, "fro") < 0.15 for R in R_list)
+    if all_identity:
+        print(
+            "[train_3dgs] WARNING: All camera rotations are near identity. "
+            "Poses may be wrong → color can fail to learn (gray output). "
+            "Consider re-running Stage 2 with ROMP/simple_romp installed for pose-aware cameras.",
+            flush=True,
+        )
     RasterSettings, GaussianRasterizer = _get_gaussian_rasterizer()
 
     num_points = len(points)
@@ -353,11 +406,25 @@ def run(
     gaussians._log_scale.data.fill_(float(np.log(INIT_SCALE)))
     gaussians._logit_opacity.data = torch.logit(torch.full((num_points, 1), INIT_OPACITY, device=device))
 
-    # DC color: init from GT mean (not black). Critical for color learning.
+    # DC color: init from GT mean (not black). Optionally per-point from first view to break gray symmetry.
     dc_init = _initial_dc_color_from_gt(
         image_dir, image_list, device, n_images=INIT_DC_FROM_GT_N_IMAGES
     )
-    gaussians._sh_dc.data = dc_init.expand(num_points, 1, 3).clone()
+    if INIT_DC_FROM_VIEW and image_list and cameras:
+        first_gt = _load_gt_image(image_dir, image_list[0]).to(device)
+        sampled = _sample_gt_colors_at_points(cameras[0], first_gt, gaussians.get_xyz(), device)
+        fallback_rgb = dc_init.squeeze(0).squeeze(0)
+        valid = torch.isfinite(sampled).all(dim=1)
+        dc_data = torch.where(
+            valid.unsqueeze(1),
+            sampled.clamp(0.0, 1.0),
+            fallback_rgb.unsqueeze(0).expand(num_points, 3),
+        )
+        gaussians._sh_dc.data = dc_data.unsqueeze(1).clone()
+        n_valid = valid.sum().item()
+        print(f"[train_3dgs] DC init: {n_valid}/{num_points} points from first-view projection, rest from mean.", flush=True)
+    else:
+        gaussians._sh_dc.data = dc_init.expand(num_points, 1, 3).clone()
 
     # Debug: log initial energy so we can confirm non-black
     with torch.no_grad():
@@ -369,13 +436,14 @@ def run(
         flush=True,
     )
 
+    # Color (SH) needs higher lr so it can move when cameras are imperfect; default was 0.01 → too small
     optimizer = torch.optim.Adam(
         [
             {"params": [gaussians._xyz], "lr": lr * 0.01},
             {"params": [gaussians._log_scale], "lr": lr},
             {"params": [gaussians._quat], "lr": lr * 0.001},
             {"params": [gaussians._logit_opacity], "lr": lr * 0.05},
-            {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.01},
+            {"params": [gaussians._sh_dc, gaussians._sh_rest], "lr": lr * 0.2},
         ]
     )
 
